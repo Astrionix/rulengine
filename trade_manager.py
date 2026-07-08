@@ -251,9 +251,9 @@ class TradeManager:
         if side == 'BUY':
             # Stage 1: Breakeven (+1x ATR)
             if not trade['breakeven_triggered'] and price >= entry + atr_14:
-                new_sl = entry
+                new_sl = entry - (0.3 * atr_14)
                 trade['breakeven_triggered'] = True
-                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry}")
+                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry} with buffer {new_sl}")
             
             # Stage 2: Active Trailing (+2x ATR)
             if price >= entry + 2 * atr_14:
@@ -265,9 +265,9 @@ class TradeManager:
         else: # SELL
             # Stage 1: Breakeven (+1x ATR)
             if not trade['breakeven_triggered'] and price <= entry - atr_14:
-                new_sl = entry
+                new_sl = entry + (0.3 * atr_14)
                 trade['breakeven_triggered'] = True
-                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry}")
+                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry} with buffer {new_sl}")
             
             # Stage 2: Active Trailing (+2x ATR)
             if price <= entry - 2 * atr_14:
@@ -365,19 +365,33 @@ class TradeManager:
         if bot:
             bot.state.consecutive_losses = self.consecutive_losses
             
+        # Move lists
+        self.trade_history.append(trade)
+        if trade in self.active_trades:
+            self.active_trades.remove(trade)
+
         # If consecutive losses reach 2, pause trading
         if self.consecutive_losses >= Config.MAX_CONSECUTIVE_LOSSES:
             from telegram_alert import alert_consecutive_losses
             if bot:
                 bot.state.is_running = False
                 bot.state.status = "STOPPED"
+                bot.state.trading_halted = True
                 logger.warning(f"[USER {self.user_id}] Pausing bot due to {self.consecutive_losses} consecutive losses.")
             alert_consecutive_losses(self.user_id)
 
-        # Move lists
-        self.trade_history.append(trade)
-        if trade in self.active_trades:
-            self.active_trades.remove(trade)
+        # Session P&L Circuit Breaker
+        session_pnl = self.get_daily_pnl()
+        active_capital = getattr(bot.state, 'active_capital', Config.MANUAL_CAPITAL) if bot else Config.MANUAL_CAPITAL
+        daily_drawdown_limit = -(active_capital * 0.5 / 100) # 0.5% limit
+        if session_pnl <= daily_drawdown_limit:
+            if bot and not getattr(bot.state, 'trading_halted', False):
+                bot.state.is_running = False
+                bot.state.status = "STOPPED"
+                bot.state.trading_halted = True
+                logger.warning(f"[USER {self.user_id}] Session P&L {session_pnl} hit drawdown limit {daily_drawdown_limit}. Halting.")
+                from telegram_alert import alert_telegram
+                alert_telegram(f"🚨 Daily drawdown limit hit (P&L: {session_pnl:.2f}) — trading paused for the day.")
             
         logger.info(f"Trade closed: {trade['id']}, Reason: {reason}, PnL: {trade['pnl']}, Consecutive Losses: {self.consecutive_losses}")
         trade_logger.info(f"CLOSED TRADE: [id={trade['id']}, symbol={trade['symbol']}, reason={reason}, final_pnl={trade['pnl']}, exit_price={trade['current_price']}]")

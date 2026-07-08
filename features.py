@@ -43,8 +43,10 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df['rsi_14'] = 100 - (100 / (1 + rs))
     df['rsi_14'] = df['rsi_14'].fillna(50)
 
-    # ── EMA 20 ────────────────────────────────────────────────────────────────
+    # ── EMA 20, 9, 21 ─────────────────────────────────────────────────────────
     df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
 
     # ── Candle Strength (unchanged — correct formula) ─────────────────────────
     df['high_low_range'] = df['high'] - df['low']

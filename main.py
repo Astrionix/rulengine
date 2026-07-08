@@ -381,7 +381,57 @@ def run_local_rule_analysis(feature_payloads: list) -> list:
 # PER-USER TRADING CYCLE (v2 Pipeline-Based)
 # ────────────────────────────────────────────────────────────────────────────
 
-async def user_trading_cycle(user_id: int):
+def _evaluate_market_regime(bot, user_id, layer4, participation_ratio):
+    from telegram_alert import alert_telegram
+    nifty_chg_pct = layer4.get_nifty_change_pct()
+    vix_val = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+    
+    nifty_df = bot.engine.get_ohlc("NSE_INDEX|Nifty 50", interval="5minute")
+    nifty_high_vs_open = 0.0
+    nifty_low_vs_open = 0.0
+    
+    if not nifty_df.empty:
+        nifty_df['ist_time'] = nifty_df['timestamp'].dt.tz_convert('Asia/Kolkata') if nifty_df['timestamp'].dt.tz else nifty_df['timestamp'].dt.tz_localize('Asia/Kolkata')
+        mask = (nifty_df['ist_time'].dt.time >= time(9, 15)) & (nifty_df['ist_time'].dt.time < time(9, 30))
+        nifty_15m = nifty_df.loc[mask]
+        if not nifty_15m.empty:
+            n_open = float(nifty_15m.iloc[0]['open'])
+            n_high = float(nifty_15m['high'].max())
+            n_low = float(nifty_15m['low'].min())
+            nifty_high_vs_open = (n_high - n_open) / n_open * 100
+            nifty_low_vs_open = (n_low - n_open) / n_open * 100
+            
+    # Regime Logic
+    old_regime = getattr(bot.state, 'market_regime', "UNKNOWN")
+    
+    regime_flags = []
+    
+    if nifty_chg_pct < -1.5:
+        regime_flags.append("TRENDING_DOWN") # Hourly override logic for material changes
+    elif nifty_chg_pct < -0.3 and nifty_low_vs_open < 0:
+        regime_flags.append("TRENDING_DOWN")
+    elif nifty_chg_pct > 0.3 and nifty_high_vs_open > 0:
+        regime_flags.append("TRENDING_UP")
+        
+    if vix_val > 18:
+        regime_flags.append("HIGH_VOLATILITY")
+        
+    if abs(nifty_chg_pct) < 0.3 and participation_ratio < 1.2:
+        regime_flags.append("RANGING")
+        
+    if not regime_flags:
+        regime_flags.append("RANGING") # Default cautious
+
+    new_regime = ",".join(regime_flags)
+
+    bot.state.market_regime = new_regime
+    logger.info(f"[USER {user_id}] Market Regime Classified: {bot.state.market_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
+    
+    if old_regime != "UNKNOWN" and old_regime != new_regime:
+        alert_telegram(f"⚠️ Market regime dynamically updated from {old_regime} to {new_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
+
+
+async def trading_cycle_task(user_id: int):
     """
     Per-user trading cycle — v2 pipeline-based.
     Runs as its own asyncio Task. Implements the full daily schedule (Section 7).
@@ -599,6 +649,7 @@ async def user_trading_cycle(user_id: int):
                 
                 if total_expected_15min_vol > 0:
                     participation_ratio = total_actual_15min_vol / total_expected_15min_vol
+                    bot.state.participation_ratio = participation_ratio
                     if participation_ratio < 0.8:
                         bot.state.day_type = "LOW_PARTICIPATION"
                     elif participation_ratio > 2.0:
@@ -607,43 +658,21 @@ async def user_trading_cycle(user_id: int):
                         bot.state.day_type = "NORMAL"
                     logger.info(f"[USER {user_id}] 15-min Participation Ratio: {participation_ratio:.2f} -> {bot.state.day_type}")
                     
-                    # --- Addition 2: Market Regime Classifier ---
-                    nifty_chg_pct = layer4.get_nifty_change_pct()
-                    vix_val = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
-                    
-                    nifty_df = bot.engine.get_ohlc("NSE_INDEX|Nifty 50", interval="5minute")
-                    nifty_high_vs_open = 0.0
-                    nifty_low_vs_open = 0.0
-                    
-                    if not nifty_df.empty:
-                        nifty_df['ist_time'] = nifty_df['timestamp'].dt.tz_convert('Asia/Kolkata') if nifty_df['timestamp'].dt.tz else nifty_df['timestamp'].dt.tz_localize('Asia/Kolkata')
-                        mask = (nifty_df['ist_time'].dt.time >= time(9, 15)) & (nifty_df['ist_time'].dt.time < time(9, 30))
-                        nifty_15m = nifty_df.loc[mask]
-                        if not nifty_15m.empty:
-                            n_open = float(nifty_15m.iloc[0]['open'])
-                            n_high = float(nifty_15m['high'].max())
-                            n_low = float(nifty_15m['low'].min())
-                            nifty_high_vs_open = (n_high - n_open) / n_open * 100
-                            nifty_low_vs_open = (n_low - n_open) / n_open * 100
-                            
-                    # Regime Logic
-                    if vix_val > 18:
-                        bot.state.market_regime = "HIGH_VOLATILITY"
-                    elif abs(nifty_chg_pct) < 0.3 and participation_ratio < 1.2:
-                        bot.state.market_regime = "RANGING"
-                    elif nifty_chg_pct > 0.3 and nifty_high_vs_open > 0:
-                        bot.state.market_regime = "TRENDING_UP"
-                    elif nifty_chg_pct < -0.3 and nifty_low_vs_open < 0:
-                        bot.state.market_regime = "TRENDING_DOWN"
-                    else:
-                        bot.state.market_regime = "RANGING"  # Default cautious
+                    _evaluate_market_regime(bot, user_id, layer4, participation_ratio)
                         
-                    logger.info(f"[USER {user_id}] Market Regime Classified: {bot.state.market_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
-
             except Exception as e:
                 logger.error(f"[USER {user_id}] Error calculating regime/volume: {e}")
                 bot.state.day_type = "NORMAL"
                 bot.state.market_regime = "RANGING"
+
+        # ── Hourly Regime Re-Classification ──────────────────────────────
+        if now.minute == 30 and now.time() >= time(10, 30):
+            if getattr(bot.state, 'last_regime_check_hour', None) != now.hour:
+                bot.state.last_regime_check_hour = now.hour
+                try:
+                    _evaluate_market_regime(bot, user_id, layer4, getattr(bot.state, 'participation_ratio', 1.0))
+                except Exception as e:
+                    logger.error(f"[USER {user_id}] Error in hourly regime check: {e}")
 
 
         # ── 15:15 PM — Force exit all positions ──────────────────────────
@@ -713,6 +742,7 @@ async def user_trading_cycle(user_id: int):
         orb_window_active = time(9, 30) <= now.time() < time(11, 0)
         if (orb_obs_complete and orb_window_active
                 and get_global_trading_enabled()
+                and not getattr(bot.state, 'trading_halted', False)
                 and (orb_now_ts - orb_last_scan) >= 60):
             orb_last_scan = orb_now_ts
             try:
@@ -752,8 +782,16 @@ async def user_trading_cycle(user_id: int):
                     else:
                         time_bucket = "AFTERNOON"
 
+                    target_multiplier = 2.0
+                    market_regime = getattr(bot.state, "market_regime", "UNKNOWN")
+                    if "TRENDING_UP" in market_regime or "TRENDING_DOWN" in market_regime:
+                        target_multiplier = 2.5
+                    elif "RANGING" in market_regime or "HIGH_VOLATILITY" in market_regime:
+                        target_multiplier = 1.5
+
                     orb_payload = {
                         "symbol": orb_sig["symbol"],
+                        "target_multiplier": target_multiplier,
                         "signal_direction": orb_sig["direction"],
                         "signal_time": signal_time,
                         "time_bucket": time_bucket,
@@ -869,7 +907,7 @@ async def user_trading_cycle(user_id: int):
                 # Only proceed to Layer 4+5 before the entry cutoff
                 if signals and now.time() < time(cutoff_h, cutoff_m):
                     # Check global halt for new entries
-                    if get_global_trading_enabled():
+                    if get_global_trading_enabled() and not getattr(bot.state, 'trading_halted', False):
                         # Layer 4: Feature extraction
                         feature_payloads = layer4.extract(
                             signals, _shared_prices, _shared_state.live_indices, 
@@ -997,18 +1035,20 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
         logger.warning(f"[USER {user_id}] Max open trades limit reached ({active_trades_count}/{max_open}). Skipping trade for {symbol}.")
         return
 
-    # Step 4 — Quantity calculation
-    # Divide capital by MAX_OPEN_TRADES (concurrent positions), not MAX_TRADES_PER_DAY
-    per_trade_capital = bot.state.active_capital / max_open
-    # Apply 5x intraday leverage — Upstox grants up to 5x for product="I" (intraday)
-    INTRADAY_LEVERAGE = 5
-    effective_capital = per_trade_capital * INTRADAY_LEVERAGE
-    quantity = math.floor(effective_capital / entry_price)
+    # Step 4 — Quantity calculation (Risk-based)
+    daily_loss_limit = bot.config.get('DAILY_LOSS_LIMIT', Config.DAILY_LOSS_LIMIT)
+    risk_per_trade = daily_loss_limit / max_trades
+    sl_distance = abs(entry_price - stop_loss)
+    
+    if sl_distance <= 0.0:
+        logger.warning(f"[USER {user_id}] Invalid SL distance {sl_distance} for {symbol}. Skipping.")
+        return
+        
+    quantity = math.floor(risk_per_trade / sl_distance)
     logger.info(
-        f"[USER {user_id}] Qty calc: capital={bot.state.active_capital:.0f}, "
-        f"max_open={max_open}, per_trade=Rs{per_trade_capital:.0f}, "
-        f"leverage={INTRADAY_LEVERAGE}x, effective=Rs{effective_capital:.0f}, "
-        f"price={entry_price:.2f} -> qty={quantity} for {symbol}"
+        f"[USER {user_id}] Risk_Per_Trade calc: daily_loss_limit=Rs{daily_loss_limit:.0f}, "
+        f"max_trades={max_trades}, risk_per_trade=Rs{risk_per_trade:.0f}, "
+        f"entry={entry_price:.2f}, sl={stop_loss:.2f}, sl_dist={sl_distance:.2f} -> qty={quantity} for {symbol}"
     )
     if quantity <= 0:
         logger.warning(f"[USER {user_id}] Quantity rounds to 0 for {symbol}. Skipping.")

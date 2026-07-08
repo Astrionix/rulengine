@@ -240,9 +240,17 @@ class FeatureExtractor:
         else:
             time_bucket = "AFTERNOON"
 
+        # ── Target Multiplier (Adaptive) ──────────────────────────────────
+        target_multiplier = 2.0
+        if "TRENDING_UP" in market_regime or "TRENDING_DOWN" in market_regime:
+            target_multiplier = 2.5
+        elif "RANGING" in market_regime or "HIGH_VOLATILITY" in market_regime:
+            target_multiplier = 1.5
+
         # ── Build payload ─────────────────────────────────────────────────
         return {
             "symbol": symbol,
+            "target_multiplier": target_multiplier,
             "signal_direction": direction,
             "signal_time": signal_time,
             "time_bucket": time_bucket,

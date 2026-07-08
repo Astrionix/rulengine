@@ -107,8 +107,10 @@ class SignalScanner:
             instrument_key = stock.get("instrument_key", "")
             direction_bias = stock.get("direction_bias", "LONG_CANDIDATE")
 
-            # Skip if already in active trade
+            # Skip if already in active trade (This explicitly blocks Momentum 
+            # signals on stocks that have an active ORB trade during the 10:15-11:00 overlap)
             if symbol in active_set:
+                logger.debug(f"[Layer 3] Skipping {symbol} — already has an active trade.")
                 continue
 
             # Skip if blacklisted (already traded today)
@@ -184,8 +186,8 @@ class SignalScanner:
             close = float(latest['close'])
             vwap = float(latest.get('vwap', close))
             rsi_14 = float(latest.get('rsi_14', 50.0))
-            ema_20 = float(latest.get('ema_20', close))
-            ema_20_prev = float(prev.get('ema_20', ema_20))
+            ema_9 = float(latest.get('ema_9', close))
+            ema_21 = float(latest.get('ema_21', close))
 
             # Volume ratio (6-bar)
             vol_ma_6 = df['volume'].iloc[-7:-1].mean() if len(df) >= 7 else df['volume'].mean()
@@ -224,7 +226,7 @@ class SignalScanner:
                     conditions_met += 1
                 if 58 <= rsi_14 <= 75:
                     conditions_met += 1
-                if ema_20 > ema_20_prev:
+                if ema_9 > ema_21:
                     conditions_met += 1
                 if candle_strength >= 0.50:
                     conditions_met += 1
@@ -235,7 +237,7 @@ class SignalScanner:
                     conditions_met += 1
                 if 25 <= rsi_14 <= 42:
                     conditions_met += 1
-                if ema_20 < ema_20_prev:
+                if ema_9 < ema_21:
                     conditions_met += 1
                 if candle_strength >= 0.50:
                     conditions_met += 1

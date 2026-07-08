@@ -67,16 +67,16 @@ Each object must contain exactly these fields:
   wider than 1.5x ATR, return SKIP — the risk is too large.
 
 ─── TARGET RULES ─────────────────────────────────────────────────────────────────
-- Target must deliver a minimum 2.0:1 reward-to-risk ratio.
+- Target must deliver a minimum reward-to-risk ratio defined by target_multiplier in the input.
   risk = abs(entry_price - stop_loss)
-  target must be at least: entry_price + (2.0 * risk) for LONG
-                            entry_price - (2.0 * risk) for SHORT
-- For LONG: target must not exceed resistance_20bar_5min. If achieving a 2.0:1 R:R target 
+  target must be at least: entry_price + (target_multiplier * risk) for LONG
+                            entry_price - (target_multiplier * risk) for SHORT
+- For LONG: target must not exceed resistance_20bar_5min. If achieving the required R:R target 
   would require going above resistance_20bar_5min, return SKIP. 
   The only exception: if vol_ratio_6bar_5min > 3.0 AND volume_trend is "expanding" — 
   breakout through resistance is plausible. In this case, target can go up to 
   resistance + 0.5% maximum.
-- Preferred target is at the next meaningful resistance level with R:R >= 2.0.
+- Preferred target is at the next meaningful resistance level with required R:R.
 
 ─── MULTI-CANDLE STRUCTURE ANALYSIS ──────────────────────────────────────────
 You receive a list of the most recent completed 5-minute candles in the "recent_candles_5min" array (chronologically ordered, up to 20 candles maximum). Use this historical series to analyze the intermediate-term price action trend and volume profile:
@@ -99,15 +99,16 @@ MARKET DIRECTION OVERRIDE (MANDATORY):
     If confidence < 5 → return SKIP, red_flag: "strong bullish market"
 
 MARKET REGIME ADAPTATION (MANDATORY):
-  Evaluate the "market_regime" field in the market_context.
-  If market_regime is "RANGING":
+  Evaluate the "market_regime" field in the market_context. It is a comma-separated list of flags.
+  If "RANGING" is in market_regime:
     Only accept SHORT signals below VWAP and LONG signals above VWAP by more than 0.3%. Require confidence >= 4.
-  If market_regime is "TRENDING_UP":
+  If "TRENDING_UP" is in market_regime:
     Prefer LONG signals. SHORT signals require confidence 5.
-  If market_regime is "TRENDING_DOWN":
+  If "TRENDING_DOWN" is in market_regime:
     Prefer SHORT signals. LONG signals require confidence 5.
-  If market_regime is "HIGH_VOLATILITY":
+  If "HIGH_VOLATILITY" is in market_regime:
     Require confidence 5 for all signals, as market is unpredictable.
+  (Note: Apply all rules that match the active flags in market_regime. E.g., if both TRENDING_DOWN and HIGH_VOLATILITY are present, require confidence 5 for ALL signals).
 
 MANDATORY SKIP conditions (return SKIP immediately, confidence is irrelevant):
   1. signal_direction does not match the clear price action. If data suggests LONG but
