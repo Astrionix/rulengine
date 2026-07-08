@@ -98,6 +98,17 @@ MARKET DIRECTION OVERRIDE (MANDATORY):
     All SHORT signals → require confidence 5 to ENTER.
     If confidence < 5 → return SKIP, red_flag: "strong bullish market"
 
+MARKET REGIME ADAPTATION (MANDATORY):
+  Evaluate the "market_regime" field in the market_context.
+  If market_regime is "RANGING":
+    Only accept SHORT signals below VWAP and LONG signals above VWAP by more than 0.3%. Require confidence >= 4.
+  If market_regime is "TRENDING_UP":
+    Prefer LONG signals. SHORT signals require confidence 5.
+  If market_regime is "TRENDING_DOWN":
+    Prefer SHORT signals. LONG signals require confidence 5.
+  If market_regime is "HIGH_VOLATILITY":
+    Require confidence 5 for all signals, as market is unpredictable.
+
 MANDATORY SKIP conditions (return SKIP immediately, confidence is irrelevant):
   1. signal_direction does not match the clear price action. If data suggests LONG but
      signal_direction is SHORT (or vice versa), return SKIP with red_flag explanation.

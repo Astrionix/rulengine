@@ -41,7 +41,7 @@ class FeatureExtractor:
         self._sector_perf = {}  # {sector: pct_vs_nifty, "last_refresh": 0}
         self._sector_refresh_time = 0
 
-    def extract(self, signals: list, prices_cache: dict, indices_cache: dict, day_type: str = "NORMAL") -> list:
+    def extract(self, signals: list, prices_cache: dict, indices_cache: dict, market_regime: str = "UNKNOWN") -> list:
         """
         Extract features for each qualifying stock from Layer 3.
         
@@ -62,7 +62,7 @@ class FeatureExtractor:
         payloads = []
         for signal in signals:
             try:
-                payload = self._extract_single(signal, prices_cache, day_type)
+                payload = self._extract_single(signal, prices_cache, market_regime)
                 if payload:
                     payloads.append(payload)
             except Exception as e:
@@ -72,7 +72,7 @@ class FeatureExtractor:
         logger.info(f"[Layer 4] Extracted features for {len(payloads)} stocks.")
         return payloads
 
-    def _extract_single(self, signal: dict, prices_cache: dict, day_type: str = "NORMAL") -> dict:
+    def _extract_single(self, signal: dict, prices_cache: dict, market_regime: str = "UNKNOWN") -> dict:
         """Extract full feature payload for a single stock."""
         symbol = signal["symbol"]
         instrument_key = signal["instrument_key"]
@@ -280,7 +280,7 @@ class FeatureExtractor:
             },
 
             "market_context": {
-                "day_type": day_type,
+                "market_regime": market_regime,
                 "nifty_trend_today": self._nifty_trend.get("trend", "sideways"),
                 "india_vix": round(self._vix_value.get("value", 0), 1),
                 "sector": sector,

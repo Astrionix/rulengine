@@ -153,6 +153,7 @@ class Trade(Base):
     sector_aligned    = Column(Boolean, nullable=True)       # sector moving with trade?
     vix_at_entry      = Column(Float, nullable=True)         # India VIX at time of entry
     time_of_day_bucket = Column(String(20), nullable=True)  # MORNING / MIDDAY / AFTERNOON
+    market_regime     = Column(String(20), nullable=True)   # TRENDING_UP / RANGING etc
     would_have_entered_without_claude = Column(Boolean, default=False)
 
     user = relationship("User", back_populates="trades")
@@ -447,6 +448,7 @@ def init_db():
                 ("sector_aligned",    "BOOLEAN NULL"),
                 ("vix_at_entry",      "FLOAT NULL"),
                 ("time_of_day_bucket","VARCHAR(20) NULL"),
+                ("market_regime",     "VARCHAR(20) NULL"),
             ]:
                 result = conn.execute(text(f"SHOW COLUMNS FROM trades LIKE '{col_name}'")).fetchone()
                 if not result:

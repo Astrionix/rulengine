@@ -606,9 +606,44 @@ async def user_trading_cycle(user_id: int):
                     else:
                         bot.state.day_type = "NORMAL"
                     logger.info(f"[USER {user_id}] 15-min Participation Ratio: {participation_ratio:.2f} -> {bot.state.day_type}")
+                    
+                    # --- Addition 2: Market Regime Classifier ---
+                    nifty_chg_pct = layer4.get_nifty_change_pct()
+                    vix_val = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+                    
+                    nifty_df = bot.engine.get_ohlc("NSE_INDEX|Nifty 50", interval="5minute")
+                    nifty_high_vs_open = 0.0
+                    nifty_low_vs_open = 0.0
+                    
+                    if not nifty_df.empty:
+                        nifty_df['ist_time'] = nifty_df['timestamp'].dt.tz_convert('Asia/Kolkata') if nifty_df['timestamp'].dt.tz else nifty_df['timestamp'].dt.tz_localize('Asia/Kolkata')
+                        mask = (nifty_df['ist_time'].dt.time >= time(9, 15)) & (nifty_df['ist_time'].dt.time < time(9, 30))
+                        nifty_15m = nifty_df.loc[mask]
+                        if not nifty_15m.empty:
+                            n_open = float(nifty_15m.iloc[0]['open'])
+                            n_high = float(nifty_15m['high'].max())
+                            n_low = float(nifty_15m['low'].min())
+                            nifty_high_vs_open = (n_high - n_open) / n_open * 100
+                            nifty_low_vs_open = (n_low - n_open) / n_open * 100
+                            
+                    # Regime Logic
+                    if vix_val > 18:
+                        bot.state.market_regime = "HIGH_VOLATILITY"
+                    elif abs(nifty_chg_pct) < 0.3 and participation_ratio < 1.2:
+                        bot.state.market_regime = "RANGING"
+                    elif nifty_chg_pct > 0.3 and nifty_high_vs_open > 0:
+                        bot.state.market_regime = "TRENDING_UP"
+                    elif nifty_chg_pct < -0.3 and nifty_low_vs_open < 0:
+                        bot.state.market_regime = "TRENDING_DOWN"
+                    else:
+                        bot.state.market_regime = "RANGING"  # Default cautious
+                        
+                    logger.info(f"[USER {user_id}] Market Regime Classified: {bot.state.market_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
+
             except Exception as e:
-                logger.error(f"[USER {user_id}] Error calculating 15-min volume: {e}")
+                logger.error(f"[USER {user_id}] Error calculating regime/volume: {e}")
                 bot.state.day_type = "NORMAL"
+                bot.state.market_regime = "RANGING"
 
 
         # ── 15:15 PM — Force exit all positions ──────────────────────────
@@ -838,7 +873,7 @@ async def user_trading_cycle(user_id: int):
                         # Layer 4: Feature extraction
                         feature_payloads = layer4.extract(
                             signals, _shared_prices, _shared_state.live_indices, 
-                            day_type=getattr(bot.state, "day_type", "NORMAL")
+                            market_regime=getattr(bot.state, "market_regime", "UNKNOWN")
                         )
 
                         if feature_payloads:
@@ -1109,6 +1144,7 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
             db_trade.sector_aligned     = l3_signal.get("sector_aligned", None)
             db_trade.vix_at_entry       = round(vix_now, 1) if vix_now else None
             db_trade.time_of_day_bucket = tod_bucket
+            db_trade.market_regime      = getattr(bot.state, 'market_regime', 'UNKNOWN')
 
             # ── Check if Python rules would have entered without Claude ──
             would_enter_no_claude = False
