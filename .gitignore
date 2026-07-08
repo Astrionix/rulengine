@@ -41,3 +41,9 @@ env/
 # Sensitive files
 backend.pem
 config.json
+*.pem
+*.ppk
+*.db
+*.sql
+scratch/
+intradaybot.service

@@ -1,4 +1,5 @@
 import logging
+import time as _time
 import requests
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -7,18 +8,37 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 class UpstoxExecutionEngine:
-    def __init__(self):
-        self.api_v2 = "https://api.upstox.com/v2"
-        self.api_v3 = "https://api.upstox.com/v3"
-        
+    def __init__(self, credentials: dict = None, mode: str = None):
+        """
+        Args:
+            credentials: dict with keys upstox_access_token, analytics_token,
+                         upstox_client_id, upstox_client_secret.
+                         If None, falls back to Config (legacy single-user mode).
+            mode: "TEST" or "LIVE". If None, defaults to Config.MODE.
+        """
+        self.api_v2  = "https://api.upstox.com/v2"
+        self.api_v3  = "https://api.upstox.com/v3"
+        # HFT endpoint for order placement (Place/Modify/Cancel Order V3)
+        # Official Upstox docs: https://upstox.com/developer/api-documentation/v3/place-order
+        # Correct URL: https://api-hft.upstox.com/v3/order/place  (V3, not V2!)
+        self.api_hft = "https://api-hft.upstox.com/v3"
+        self._creds = credentials  # per-user credentials dict or None
+        self.mode = mode or Config.MODE
+
     def _get_headers(self, use_analytics=False):
-        token = Config.UPSTOX_ACCESS_TOKEN
-        if use_analytics and Config.ANALYTICS_TOKEN:
-            token = Config.ANALYTICS_TOKEN
+        if self._creds:
+            token = self._creds.get("analytics_token", "") if use_analytics else self._creds.get("upstox_access_token", "")
+            if not token:  # fall through to the other token if one is empty
+                token = self._creds.get("upstox_access_token", "") or self._creds.get("analytics_token", "")
+        else:
+            token = Config.UPSTOX_ACCESS_TOKEN
+            if use_analytics and Config.ANALYTICS_TOKEN:
+                token = Config.ANALYTICS_TOKEN
         return {
             'Accept': 'application/json',
             'Authorization': f'Bearer {token}',
         }
+
 
     def connect(self):
         logger.info("Initializing Upstox API Connection...")
@@ -34,39 +54,22 @@ class UpstoxExecutionEngine:
             logger.error(f"Upstox connection error: {e}")
             return False
 
-    def get_funds(self) -> float:
-        """Fetch real user balance (available margin) if LIVE mode is enabled."""
-        if Config.MODE == "TEST" or not getattr(Config, 'USE_LIVE_CAPITAL', False):
-            return getattr(Config, 'MANUAL_CAPITAL', Config.CAPITAL)
-            
-        try:
-            # Reconstruct headers block just in case token dynamically updated via config
-            hdrs = self._get_headers()
-            url = f"{self.api_v2}/user/get-funds-and-margin"
-            res = requests.get(url, headers=hdrs, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if 'data' in data and 'equity' in data['data']:
-                    eq = data['data']['equity']
-                    # Priority list for available funds
-                    margin = None
-                    for key in ['available_margin', 'available_funds', 'net', 'cash']:
-                        val = eq.get(key)
-                        if val is not None:
-                            margin = float(val)
-                            break
-                    
-                    if margin is not None:
-                        logger.info(f"Fetched live funds from Upstox: ₹{margin}")
-                        return margin
-                    else:
-                        logger.warning(f"Could not find any fund fields in Upstox response. Keys: {list(eq.keys())}")
-            else:
-                logger.error(f"Failed to fetch live funds (Status {res.status_code}): {res.text}")
-        except Exception as e:
-            logger.error(f"Error fetching live funds: {e}")
-            
-        return getattr(Config, 'MANUAL_CAPITAL', Config.CAPITAL)
+    def get_funds(self, force_live: bool = False) -> float:
+        """Fetch real user balance (available margin) if LIVE mode is enabled or force_live is True."""
+        if force_live or getattr(Config, 'USE_LIVE_CAPITAL', False):
+            try:
+                url = f"{self.api_v2}/user/get-funds-and-margin"
+                res = requests.get(url, headers=self._get_headers(), timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    if 'data' in data and 'equity' in data['data']:
+                        return float(data['data']['equity'].get('available_margin', 0))
+                else:
+                    logger.warning(f"Upstox Funds API returned {res.status_code}: {res.text}")
+            except Exception as e:
+                logger.error(f"Error fetching live funds: {e}")
+            return 0.0  # If live capital fails, do NOT fallback to manual capital for safety
+        return getattr(Config, 'MANUAL_CAPITAL', 10000.0)
 
     def get_ltp(self, instrument_key: str) -> float:
         """Fetch real-time Last Traded Price (LTP) using Full Market Quotes API."""
@@ -176,6 +179,18 @@ class UpstoxExecutionEngine:
                     matched_key = key_map.get(raw_key)
                     if matched_key:
                         quotes[matched_key] = quote_data
+                    else:
+                        # Fallback for ISIN-based keys mapped to ticker name in API response
+                        suffix = raw_key.split(':')[-1].split('|')[-1]
+                        if suffix in Config.SYMBOLS_MAPPING:
+                            mapped_key = Config.SYMBOLS_MAPPING[suffix]
+                            if mapped_key in instrument_keys:
+                                quotes[mapped_key] = quote_data
+                                continue
+                        for k in instrument_keys:
+                            if suffix in k:
+                                quotes[k] = quote_data
+                                break
         except Exception as e:
             logger.warning(f"Market quotes fetch error: {e}")
         return quotes
@@ -228,35 +243,115 @@ class UpstoxExecutionEngine:
         
         return pd.DataFrame()
 
+    def get_order_book(self) -> list:
+        if self.mode == "TEST":
+            return []
+        try:
+            url = f"{self.api_v2}/order/retrieve-all"
+            response = requests.get(url, headers=self._get_headers(), timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', [])
+            else:
+                logger.error(f"Failed to fetch order book: {response.text}")
+        except Exception as e:
+            logger.error(f"Error fetching order book: {e}")
+        return []
+
+    def get_order_status(self, order_id: str) -> dict:
+        """
+        Retrieves status of a specific order.
+        """
+        if self.mode == "TEST":
+            return {"status": "success", "order_status": "complete", "filled_quantity": 0}
+        try:
+            orders = self.get_order_book()
+            for o in orders:
+                if o.get('order_id') == order_id:
+                    return {
+                        "status": "success",
+                        "order_status": o.get('status'),
+                        "filled_quantity": int(o.get('filled_quantity', 0)),
+                        "quantity": int(o.get('quantity', 0)),
+                        "average_price": float(o.get('average_price', 0.0))
+                    }
+        except Exception as e:
+            logger.error(f"Error fetching order status for {order_id}: {e}")
+        return {"status": "error", "reason": "Order not found or API error"}
+
+    def verify_order_by_details(self, instrument_token: str, transaction_type: str, qty: int, max_age_seconds: int = 60) -> dict:
+        """
+        Checks order book to see if a matching order was placed within the last max_age_seconds.
+        """
+        try:
+            orders = self.get_order_book()
+            import pytz
+            from datetime import datetime
+            now = datetime.now(pytz.timezone('Asia/Kolkata'))
+            for o in orders:
+                if o.get('instrument_token') == instrument_token and o.get('transaction_type') == transaction_type and int(o.get('quantity', 0)) == qty:
+                    ts_str = o.get('order_timestamp')
+                    if ts_str:
+                        try:
+                            # Upstox timestamp: '2026-06-27T15:02:40+05:30'
+                            if ts_str.endswith('+05:30'):
+                                ts_str = ts_str[:-6] + '+0530'
+                            ts = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S")
+                            ts = pytz.timezone('Asia/Kolkata').localize(ts)
+                            age = (now - ts).total_seconds()
+                            if age <= max_age_seconds:
+                                return {
+                                    "status": "success", 
+                                    "order_id": o.get('order_id'), 
+                                    "order_status": o.get('status'), 
+                                    "filled_quantity": int(o.get('filled_quantity', 0))
+                                }
+                        except Exception as e:
+                            logger.error(f"Error parsing order timestamp {ts_str}: {e}")
+        except Exception as e:
+            logger.error(f"Error in verify_order_by_details: {e}")
+        return {"status": "not_found"}
+
     def place_order_with_retry(self, symbol: str, side: str, qty: int, order_type: str = 'MARKET', price: float = 0.0, max_retries: int = 1) -> dict:
+        """Place order with retry logic and ghost position protection (Bug Fix 1 & 2)."""
         transaction_type = "BUY" if side.upper() == "BUY" else "SELL"
         
         payload = {
-            "quantity": qty,
-            "product": "I",
-            "validity": "DAY",
-            "price": price,
-            "tag": "intBot",
-            "instrument_token": symbol,
-            "order_type": order_type,
-            "transaction_type": transaction_type,
+            "quantity":          qty,
+            "product":           "I",          # I = Intraday (MIS)
+            "validity":          "DAY",
+            "price":             price,
+            "tag":               "intBot",
+            "instrument_token":  symbol,
+            "order_type":        order_type,   # MARKET / LIMIT / SL / SL-M
+            "transaction_type":  transaction_type,
             "disclosed_quantity": 0,
-            "trigger_price": 0,
-            "is_amo": False,
-            "slice": False
+            "trigger_price":     0,
+            "is_amo":            False,
+            "slice":             False,
+            # market_protection: -1 = auto (per Upstox V3 docs)
+            # 0 = no protection → exchange REJECTS market orders via API
+            "market_protection": -1
         }
 
         retries = 0
+        last_order_id = None  # Track any order_id we get back for verification
+        
         while retries <= max_retries:
-            logger.info(f"[{Config.MODE}] API Call: Place {side} {order_type} for {symbol}, Qty: {qty}. Attempt {retries + 1}")
+            logger.info(f"[{self.mode}] API Call: Place {side} {order_type} for {symbol}, Qty: {qty}. Attempt {retries + 1}")
             
-            if Config.MODE == "TEST":
+            if self.mode == "TEST":
                 logger.info(f"TEST MODE: Simulated successful {side} execution.")
-                return {"status": "success", "order_id": f"test_ord_{symbol}_{side}_{retries}"}
+                return {
+                    "status": "success", "order_id": f"test_ord_{symbol}_{side}_{retries}",
+                    "filled_quantity": qty, "average_price": price or 0.0
+                }
             
             try:
-                url = f"{self.api_v3}/order/place"
+                # Use HFT endpoint for intraday order placement (product='I')
+                url = f"{self.api_hft}/order/place"
                 headers = {**self._get_headers(), 'Content-Type': 'application/json'}
+                logger.info(f"Placing order via HFT endpoint: {url}")
                 response = requests.post(url, headers=headers, json=payload, timeout=10)
                 
                 response_data = response.json()
@@ -266,21 +361,85 @@ class UpstoxExecutionEngine:
                     # Extract order_ids from V3 format which returns 'order_ids' list or 'order_id'
                     order_ids = response_data['data'].get('order_ids', [])
                     order_id = order_ids[0] if order_ids else response_data['data'].get('order_id')
-                    return {"status": "success", "order_id": order_id}
+                    last_order_id = order_id
+                    
+                    # Bug Fix 2: Fetch actual filled_quantity from order status
+                    _time.sleep(0.5)  # Brief wait for exchange fill
+                    status_res = self.get_order_status(order_id)
+                    filled_qty = qty  # Default to requested qty
+                    avg_price = 0.0
+                    if status_res.get('status') == 'success':
+                        filled_qty = status_res.get('filled_quantity', qty)
+                        avg_price = status_res.get('average_price', 0.0)
+                    
+                    return {
+                        "status": "success", "order_id": order_id,
+                        "filled_quantity": filled_qty, "average_price": avg_price
+                    }
                 else:
                     logger.error(f"Upstox Order Rejected: {response_data}")
                     retries += 1
                     
             except Exception as e:
-                logger.error(f"API Crash during order placement: {str(e)}")
-                retries += 1
+                logger.error(f"API Crash/Timeout during order placement: {str(e)}")
                 
+                # Bug Fix 1: Ghost Position Protection
+                # Wait 2 seconds, then verify actual server-side status
+                logger.info("[BUG FIX 1] Waiting 2s before verifying order status on Upstox...")
+                _time.sleep(2)
+                
+                # First try: Check by order_id if we have one
+                if last_order_id:
+                    status_res = self.get_order_status(last_order_id)
+                    if status_res.get('status') == 'success':
+                        order_status = status_res.get('order_status', '').lower()
+                        if order_status in ('complete', 'traded', 'filled'):
+                            logger.info(f"[BUG FIX 1] Order {last_order_id} confirmed FILLED on Upstox despite timeout.")
+                            return {
+                                "status": "success", "order_id": last_order_id,
+                                "filled_quantity": status_res.get('filled_quantity', qty),
+                                "average_price": status_res.get('average_price', 0.0)
+                            }
+                
+                # Second try: Check order book by details
+                verify_res = self.verify_order_by_details(symbol, transaction_type, qty)
+                if verify_res.get('status') == 'success':
+                    logger.info(f"[BUG FIX 1] Verified order exists in book: {verify_res}")
+                    return {
+                        "status": "success", "order_id": verify_res['order_id'],
+                        "filled_quantity": verify_res.get('filled_quantity', qty),
+                        "average_price": 0.0
+                    }
+                
+                # If status check also fails → UNKNOWN status
+                logger.critical(
+                    f"[BUG FIX 1] ORDER STATUS UNKNOWN for {symbol} ({side}). "
+                    f"Order ID: {last_order_id or 'N/A'}. Manual check required!"
+                )
+                return {
+                    "status": "unknown",
+                    "reason": "Order status could not be verified after timeout",
+                    "order_id": last_order_id,
+                    "symbol": symbol
+                }
+                
+        # Final safety verification check
+        logger.info("Final verification check in order book before declaring failure...")
+        verify_res = self.verify_order_by_details(symbol, transaction_type, qty)
+        if verify_res.get('status') == 'success':
+            logger.info(f"Final verify confirmed order: {verify_res}")
+            return {
+                "status": "success", "order_id": verify_res['order_id'],
+                "filled_quantity": verify_res.get('filled_quantity', qty),
+                "average_price": 0.0
+            }
+
         logger.error(f"Failed to place {side} order for {symbol} after {max_retries} retries.")
         return {"status": "error", "reason": "Max retries exceeded"}
 
     def place_stop_loss(self, symbol: str, side: str, qty: int, sl_price: float) -> dict:
         transaction_type = "SELL" if side.upper() == "BUY" else "BUY"
-        logger.info(f"[{Config.MODE}] Placing Stop Loss ({transaction_type}) at {sl_price} for {symbol}")
+        logger.info(f"[{self.mode}] Placing Stop Loss ({transaction_type}) at {sl_price} for {symbol}")
         
         rounded_sl = round(sl_price * 20) / 20.0
         
@@ -299,13 +458,15 @@ class UpstoxExecutionEngine:
             "slice": False
         }
 
-        if Config.MODE == "TEST":
+        if self.mode == "TEST":
             logger.info(f"TEST MODE: Simulated SL placement at {rounded_sl}.")
             return {"status": "success", "order_id": f"test_sl_{symbol}_{side}"}
             
         try:
-            url = f"{self.api_v3}/order/place"
+            # Use HFT endpoint for intraday SL order placement
+            url = f"{self.api_hft}/order/place"
             headers = {**self._get_headers(), 'Content-Type': 'application/json'}
+            logger.info(f"Placing SL order via HFT endpoint: {url}")
             response = requests.post(url, headers=headers, json=payload, timeout=10)
             response_data = response.json()
             
@@ -322,7 +483,7 @@ class UpstoxExecutionEngine:
             return {"status": "error", "reason": str(e)}
 
     def modify_order(self, order_id: str, new_price: float, new_trigger: float, qty: int, order_type: str = "SL-M") -> dict:
-        if Config.MODE == "TEST":
+        if self.mode == "TEST":
             logger.info(f"TEST MODE: Modifying order {order_id}.")
             return {"status": "success"}
 
@@ -336,7 +497,8 @@ class UpstoxExecutionEngine:
             "trigger_price": new_trigger
         }
         try:
-            url = f"{self.api_v3}/order/modify"
+            # Use HFT endpoint for order modification
+            url = f"{self.api_hft}/order/modify"
             headers = {**self._get_headers(), 'Content-Type': 'application/json'}
             response = requests.put(url, headers=headers, json=payload, timeout=10)
             response_data = response.json()
@@ -351,12 +513,13 @@ class UpstoxExecutionEngine:
             return {"status": "error"}
 
     def cancel_order(self, order_id: str) -> dict:
-        if Config.MODE == "TEST":
+        if self.mode == "TEST":
             logger.info(f"TEST MODE: Canceling order {order_id}.")
             return {"status": "success"}
 
         try:
-            url = f"{self.api_v3}/order/cancel?order_id={order_id}"
+            # Use HFT endpoint for order cancellation
+            url = f"{self.api_hft}/order/cancel?order_id={order_id}"
             response = requests.delete(url, headers=self._get_headers(), timeout=10)
             response_data = response.json()
             if response.status_code == 200 and response_data.get('status') == 'success':
@@ -369,7 +532,7 @@ class UpstoxExecutionEngine:
             return {"status": "error"}
 
     def exit_all_positions(self) -> dict:
-        if Config.MODE == "TEST":
+        if self.mode == "TEST":
             logger.info("TEST MODE: Simulated Exit All Positions.")
             return {"status": "success"}
             
@@ -388,3 +551,46 @@ class UpstoxExecutionEngine:
         except Exception as e:
             logger.error(f"API Crash extending all positions: {e}")
             return {"status": "error"}
+
+    # ── v2 Pipeline Methods ────────────────────────────────────────────────────
+
+    def get_historical_candles_daily(self, instrument_key: str, days: int = 30) -> pd.DataFrame:
+        """Fetch daily historical candles for Layer 1 pre-filter."""
+        try:
+            to_date = date.today().isoformat()
+            from_date = (date.today() - timedelta(days=days)).isoformat()
+            url = f"{self.api_v3}/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}"
+            response = requests.get(url, headers=self._get_headers(True), timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'data' in data and 'candles' in data['data']:
+                candles = data['data']['candles']
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                df = df.iloc[::-1].reset_index(drop=True)  # Oldest first
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df
+            else:
+                logger.error(f"No daily candle data for {instrument_key}: {data}")
+                return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Error fetching daily candles for {instrument_key}: {e}")
+            return pd.DataFrame()
+
+    def get_trade_book(self) -> list:
+        """Fetch today's trade book from Upstox for reconciliation (Section 10)."""
+        if self.mode == "TEST":
+            return []
+        try:
+            url = f"{self.api_v2}/order/trades/get-trades-for-day"
+            response = requests.get(url, headers=self._get_headers(), timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', [])
+            else:
+                logger.error(f"Failed to fetch trade book: {response.text}")
+        except Exception as e:
+            logger.error(f"Error fetching trade book: {e}")
+        return []

@@ -35,9 +35,9 @@ class Config:
     ANALYTICS_TOKEN = os.getenv("ANALYTICS_TOKEN", "")
     REDIRECT_URI = os.getenv("REDIRECT_URI", "https://deepcodev.com/callback")
 
-    RISK_PER_TRADE_PCT = 0.01  # 1% of capital
     MAX_TRADES_PER_DAY = 5
-    MAX_DAILY_LOSS_PCT = -0.02  # -2%
+    MAX_DAILY_LOSS_PCT = -0.02  # (Legacy fallback)
+    DAILY_LOSS_LIMIT = 1000.0  # Max loss in ₹ before kill-switch
     TRAILING_SL_ACTIVATION = 1.0  # R-Multiple to start trailing
     MAX_OPEN_TRADES = 2
     CAPITAL = 100000.0  # (LEGACY, kept for minor fallback)
@@ -71,7 +71,7 @@ class Config:
     
     # Strategy configs
     BREAKOUT_PERIOD = 15  # For max/min (10-15 candles)
-    VOLUME_AVG_PERIOD = 5
+    VOLUME_AVG_PERIOD = 20
     TARGET_R_MIN = 1.5
     TARGET_R_MAX = 2.0
     VOLUME_SPIKE_RATIO = 1.8
@@ -80,6 +80,36 @@ class Config:
     # Universe Filter
     MIN_STOCK_PRICE = 50.0
     MAX_STOCK_PRICE = 5000.0
+
+    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() == "true"
+
+    # ── v2 Pipeline & Risk Controls (Section 6) ──────────────────────────────
+    MAX_CONSECUTIVE_LOSSES   = 2       # stops new entries after 2 consecutive losses
+    NO_NEW_ENTRIES_AFTER     = (14, 30)  # 2:30 PM IST — tuple (hour, minute)
+    FORCE_EXIT_ALL_AT        = (15, 15)  # 3:15 PM IST
+    WEBSOCKET_DISCONNECT_AT  = (15, 25)  # 3:25 PM IST
+    MAX_VIX_FOR_TRADING      = 25.0    # above this: no new entries at all
+    CAUTIOUS_VIX_THRESHOLD   = 18.0    # above this: Claude requires confidence >= 4
+    MAX_PRICE_SLIPPAGE_PCT   = 1.0     # skip entry if LTP moved >1.0% from Claude's entry
+    MAX_MOMENTUM_SLIPPAGE_PCT = 0.3    # 0.3% max slippage for Momentum entries
+    MAX_ORB_SLIPPAGE_PCT      = 0.5    # 0.5% max slippage for ORB entries
+    LAYER4_MAX_STOCKS_PER_CYCLE = 5    # maximum stocks sent to Claude per cycle
+    CANDLE_CACHE_REFRESH_MIN = 10      # refresh rolling candle cache every 10 minutes
+    MARKET_DATA_REFRESH_MIN  = 15      # refresh Nifty trend and VIX every 15 minutes
+    SECTOR_DATA_REFRESH_MIN  = 30      # refresh sector performance every 30 minutes
+
+    # ── AI / LLM Configuration ────────────────────────────────────────────────
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MODEL   = "claude-sonnet-4-6"
+    ANTHROPIC_MAX_TOKENS = 2000
+    ANTHROPIC_TEMPERATURE = 0.0
+
+    # ── Telegram Alerting ─────────────────────────────────────────────────────
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # ── Paper Trading Mode ────────────────────────────────────────────────────
+    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() == "true"
 
     # Symbols mapping (User friendly name -> Upstox Format)
 
@@ -199,15 +229,50 @@ class Config:
 
 Config.load()
     
+# === Bot State Machine ====================================================
+class BotStatus:
+    STOPPED = "STOPPED"   # User stopped / never started
+    RUNNING = "RUNNING"   # Actively trading
+    HALTED  = "HALTED"    # Emergency halt (kill-switch)
+
+
 class SystemState:
-    daily_pnl: float = 0.0
-    trades_taken: int = 0
-    consecutive_losses: int = 0
-    kill_switch_active: bool = False
-    is_running: bool = True
-    last_trade_time: dict = {}
-    blocked_symbols: dict = {} # symbol -> time_until_unblocked
-    market_condition: str = "WAITING"
-    live_indices: dict = {}
-    index_prev_close: dict = {}
-    active_capital: float = 100000.0
+    """Per-user mutable bot state. Uses __init__ so each instance gets its OWN dicts."""
+    def __init__(self):
+        self.daily_pnl          = 0.0
+        self.trades_taken       = 0
+        self.consecutive_losses = 0
+        self.kill_switch_active = False
+        self.is_running         = False   # False on boot — user must press START
+        self.last_trade_time    = {}      # symbol -> datetime
+        self.blocked_symbols    = {}      # symbol -> unblock_time
+        self.market_condition   = "WAITING"
+        self.live_indices       = {}
+        self.index_prev_close   = {}
+        self.active_capital     = 100000.0
+        self.status             = "STOPPED"
+        self.account_balance    = 0.0
+        self.usable_balance     = 0.0
+        self.last_balance_update = 0.0
+
+    def start(self):
+        """Transition to RUNNING. Always clears kill-switch so restart works after HALT."""
+        self.is_running         = True
+        self.kill_switch_active = False
+        self.status             = "RUNNING"
+
+    def stop(self):
+        """Pause trading (can be resumed with start())."""
+        self.is_running = False
+        if self.status != "HALTED":
+            self.status = "STOPPED"
+
+    def halt(self):
+        """Emergency halt — requires explicit start() to resume."""
+        self.is_running         = False
+        self.kill_switch_active = True
+        self.status             = "HALTED"
+
+    def can_trade(self) -> bool:
+        """True only when actively running AND not halted."""
+        return self.is_running and not self.kill_switch_active

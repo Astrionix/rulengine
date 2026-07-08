@@ -18,7 +18,8 @@ if not trade_logger.handlers:
 logger = logging.getLogger(__name__)
 
 class TradeManager:
-    def __init__(self):
+    def __init__(self, user_id: int):
+        self.user_id = user_id
         self.active_trades = []
         self.trade_history = []
         self._load_from_db()
@@ -27,29 +28,58 @@ class TradeManager:
         db = SessionLocal()
         try:
             today = get_ist_date()
-            # Load OPEN trades
-            open_db_trades = db.query(Trade).filter(Trade.status == 'OPEN').all()
+            # Load OPEN trades for THIS user
+            open_db_trades = db.query(Trade).filter(Trade.status == 'OPEN', Trade.user_id == self.user_id).all()
             for t in open_db_trades:
-                self.active_trades.append({
-                    'id': t.id,
-                    'timestamp': t.entry_time.isoformat() if t.entry_time else get_ist_now().isoformat(),
-                    'symbol': t.symbol,
-                    'side': t.side,
-                    'entry_price': t.entry_price,
-                    'current_price': t.entry_price, # placeholder until LTP fetch
-                    'max_favorable_price': t.entry_price,
-                    'qty': t.quantity,
-                    'sl': t.sl_price,
-                    'target': t.target_price,
-                    'probability': 0.0,
-                    'score': t.ai_score or 0.0,
-                    'pnl': 0.0,
-                    'status': 'OPEN',
-                    'sl_order_id': None # Might need re-fetching, but assuming UI reset
-                })
+                try:
+                    if t.trade_date and t.trade_date < today:
+                        logger.warning(f"DB Recovery: Found stale OPEN trade {t.id} from {t.trade_date}. Auto-closing it.")
+                        t.status = 'CLOSED'
+                        t.exit_reason = 'STALE_EOD_CLEANUP'
+                        t.exit_time = get_ist_now()
+                        t.exit_price = t.entry_price
+                        t.realized_pnl = 0.0
+                        db.commit()
+                        continue
+
+                    # Recover if breakeven was triggered
+                    is_buy = t.side.upper() == 'BUY'
+                    breakeven_triggered = False
+                    
+                    sl = t.sl_price if t.sl_price is not None else 0.0
+                    entry = t.entry_price if t.entry_price is not None else 0.0
+
+                    if is_buy and sl >= entry:
+                        breakeven_triggered = True
+                    elif not is_buy and sl <= entry:
+                        breakeven_triggered = True
+
+                    self.active_trades.append({
+                        'id': t.id,
+                        'timestamp': t.entry_time.isoformat() if t.entry_time else get_ist_now().isoformat(),
+                        'symbol': t.symbol,
+                        'side': t.side,
+                        'entry_price': t.entry_price,
+                        'current_price': t.entry_price, # placeholder until LTP fetch
+                        'max_favorable_price': t.entry_price,
+                        'qty': t.quantity,
+                        'sl': t.sl_price,
+                        'initial_sl': t.sl_price,
+                        'target': t.target_price,
+                        'probability': 0.0,
+                        'score': t.ai_score or 0.0,
+                        'pnl': 0.0,
+                        'status': 'OPEN',
+                        'metadata': {},
+                        'breakeven_triggered': breakeven_triggered,
+                        'sl_order_id': None
+                    })
+                except Exception as loop_ex:
+                    logger.error(f"Failed to recover specific trade {t.id} from DB: {loop_ex}")
+                    continue
             
-            # Load Today's CLOSED trades
-            closed_db_trades = db.query(Trade).filter(Trade.status == 'CLOSED', Trade.trade_date == today).all()
+            # Load Today's CLOSED trades for THIS user
+            closed_db_trades = db.query(Trade).filter(Trade.status == 'CLOSED', Trade.trade_date == today, Trade.user_id == self.user_id).all()
             for t in closed_db_trades:
                 self.trade_history.append({
                     'id': t.id,
@@ -60,7 +90,7 @@ class TradeManager:
                     'current_price': t.exit_price or 0.0,
                     'qty': t.quantity,
                     'sl': t.sl_price,
-                    'target': t.target_price,
+                    'initial_sl': t.sl_price,
                     'probability': 0.0,
                     'score': t.ai_score or 0.0,
                     'pnl': t.realized_pnl or 0.0,
@@ -69,7 +99,23 @@ class TradeManager:
                     'exit_time': t.exit_time.isoformat() if t.exit_time else None,
                     'sl_order_id': None
                 })
-            logger.info(f"DB Recovery: Loaded {len(self.active_trades)} OPEN and {len(self.trade_history)} CLOSED trades for today.")
+
+            # Calculate consecutive losses from today's closed trades (Bug Fix 3 recovery)
+            self.consecutive_losses = 0
+            sorted_trades = sorted(closed_db_trades, key=lambda t: t.exit_time or datetime.datetime.min)
+            for t in sorted_trades:
+                if (t.realized_pnl or 0) < 0:
+                    self.consecutive_losses += 1
+                elif (t.realized_pnl or 0) > 0:
+                    self.consecutive_losses = 0
+
+            # Update bot state if bot registered
+            from user_bot_registry import get_bot
+            bot = get_bot(self.user_id)
+            if bot:
+                bot.state.consecutive_losses = self.consecutive_losses
+
+            logger.info(f"DB Recovery: Loaded {len(self.active_trades)} OPEN and {len(self.trade_history)} CLOSED trades for today. Consecutive losses: {self.consecutive_losses}")
         except Exception as e:
             logger.error(f"Failed to load from DB: {e}")
         finally:
@@ -87,6 +133,7 @@ class TradeManager:
             'max_favorable_price': entry_price, # Added for Peak Trailing
             'qty': int(qty),
             'sl': sl,
+            'initial_sl': sl,
             'target': target,
             'probability': probability,
             'score': score,
@@ -104,6 +151,7 @@ class TradeManager:
         try:
             db_trade = Trade(
                 id=trade_id,
+                user_id=self.user_id,
                 trade_date=get_ist_date(),
                 symbol=symbol,
                 side=side,
@@ -126,7 +174,7 @@ class TradeManager:
         '''
         current_data is a dict of symbol: current_price
         '''
-        for trade in self.active_trades:
+        for trade in list(self.active_trades):
             sym = trade['symbol']
             if sym in current_data:
                 price = current_data[sym]
@@ -138,13 +186,13 @@ class TradeManager:
                 elif trade['side'] == 'SELL':
                     trade['pnl'] = (trade['entry_price'] - price) * trade['qty']
                 
-                self.check_exit_conditions(trade)
+                self.check_exit_conditions(trade, execution_engine)
                 self.manage_trailing_sl(trade, execution_engine)
 
-    def check_exit_conditions(self, trade: dict):
+    def check_exit_conditions(self, trade: dict, execution_engine=None):
         price = trade['current_price']
         sl = trade['sl']
-        target = trade['target']
+        target = trade.get('target', 0.0)
         
         exit_trade = False
         exit_reason = ""
@@ -153,16 +201,10 @@ class TradeManager:
             if price <= sl:
                 exit_trade = True
                 exit_reason = "SL Hit"
-            elif price >= target:
-                exit_trade = True
-                exit_reason = "Target Hit"
         elif trade['side'] == 'SELL':
             if price >= sl:
                 exit_trade = True
                 exit_reason = "SL Hit"
-            elif price <= target:
-                exit_trade = True
-                exit_reason = "Target Hit"
                 
         # Also check time > 3:15 PM
         now = get_ist_now()
@@ -171,12 +213,19 @@ class TradeManager:
             exit_reason = "Time Exit (> 3:15 PM)"
 
         if exit_trade:
-            self.close_trade(trade, exit_reason)
+            self.close_trade(trade, exit_reason, execution_engine)
 
     def manage_trailing_sl(self, trade: dict, execution_engine=None):
-        '''
-        ADAPTIVE ATR TRAILING SL (Phase 3)
-        '''
+        """
+        2-stage trailing Stop Loss logic (Section 5).
+        1. When price reaches +1x ATR, trigger breakeven: Move SL to entry_price (one-time).
+        2. When price reaches +2x ATR, trigger active trailing: Trail SL to (LTP - 1x ATR), updated every cycle.
+        """
+        import market_feed
+        # Prevent trailing if tick feed is stale
+        if not market_feed.is_tick_fresh(trade['symbol'], max_age=30.0):
+            return
+
         entry = trade['entry_price']
         qty = trade['qty']
         side = trade['side']
@@ -184,87 +233,159 @@ class TradeManager:
         sl_order_id = trade.get('sl_order_id')
         metadata = trade.get('metadata', {})
         
-        mkt_condition = metadata.get('market_condition', 'SIDEWAYS')
-        # Use initial ATR saved entirely into trade on entry
+        # Use initial ATR saved into trade on entry
         atr_14 = metadata.get('atr_14')
         if not atr_14:
-            atr_pct = metadata.get('atr_pct', 0.5) / 100  # Stored as % (e.g. 0.5)
+            atr_pct = metadata.get('atr_pct', 0.5) / 100
             atr_14 = entry * atr_pct if entry > 0 else 10.0
             
-        if atr_14 <= 0: return
-        
-        # Track Peak Price
-        max_p = trade.get('max_favorable_price', entry)
-        if side == 'BUY': max_p = max(max_p, price)
-        else: max_p = min(max_p, price) if max_p > 0 else price
-        trade['max_favorable_price'] = max_p
-        
-        # Determine Multiplier
-        trailing_mult = 2.5 if mkt_condition == 'TRENDING' else 1.2
-        
+        if atr_14 <= 0:
+            return
+
+        if 'breakeven_triggered' not in trade:
+            trade['breakeven_triggered'] = False
+
         new_sl = trade['sl']
+        
+        # 1. 2-stage trailing calculation
         if side == 'BUY':
-            candidate_sl = max_p - (trailing_mult * atr_14)
-            # Only move SL up
-            if candidate_sl > trade['sl']:
-                new_sl = candidate_sl
-        else:
-            candidate_sl = max_p + (trailing_mult * atr_14)
-            # Only move SL down
-            if candidate_sl < trade['sl']:
-                new_sl = candidate_sl
+            # Stage 1: Breakeven (+1x ATR)
+            if not trade['breakeven_triggered'] and price >= entry + atr_14:
+                new_sl = entry
+                trade['breakeven_triggered'] = True
+                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry}")
+            
+            # Stage 2: Active Trailing (+2x ATR)
+            if price >= entry + 2 * atr_14:
+                candidate_sl = price - atr_14
+                # Only move SL up
+                if candidate_sl > new_sl:
+                    new_sl = candidate_sl
+                    logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
+        else: # SELL
+            # Stage 1: Breakeven (+1x ATR)
+            if not trade['breakeven_triggered'] and price <= entry - atr_14:
+                new_sl = entry
+                trade['breakeven_triggered'] = True
+                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry}")
+            
+            # Stage 2: Active Trailing (+2x ATR)
+            if price <= entry - 2 * atr_14:
+                candidate_sl = price + atr_14
+                # Only move SL down
+                if candidate_sl < new_sl:
+                    new_sl = candidate_sl
+                    logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
+
+        # Rounded to tick size (0.05)
+        rounded_new_sl = round(new_sl * 20) / 20.0
+        rounded_current_sl = round(trade['sl'] * 20) / 20.0
 
         # If a physically new SL triggers, process it on the server
-        if new_sl and abs(new_sl - trade['sl']) > 0.05: # Prevent micro-modifications
-            if execution_engine and sl_order_id:
-                rounded_trigger = round(new_sl * 20) / 20.0
-                mod_res = execution_engine.modify_order(
-                    order_id=sl_order_id, 
-                    new_price=0, 
-                    new_trigger=rounded_trigger, 
-                    qty=qty, 
-                    order_type="SL-M"
-                )
-                if mod_res.get('status') == 'success':
-                    trade_logger.info(f"TRAILED PHYSICAL SL: {trade['symbol']} (Mult: {trailing_mult}x) | Old: {trade['sl']} | New: {new_sl}")
-                    trade['sl'] = new_sl
+        if abs(rounded_new_sl - rounded_current_sl) >= 0.05:
+            if execution_engine:
+                symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+                
+                # 1. Cancel existing SL order
+                if sl_order_id:
+                    cancel_res = execution_engine.cancel_order(sl_order_id)
+                    logger.info(f"Canceled old SL order {sl_order_id} for {trade['symbol']}: {cancel_res}")
+                
+                # 2. Place new SL order
+                place_res = execution_engine.place_stop_loss(symbol_key, side, qty, rounded_new_sl)
+                if place_res.get('status') == 'success':
+                    new_sl_order_id = place_res.get('order_id')
+                    trade['sl_order_id'] = new_sl_order_id
+                    trade['sl'] = rounded_new_sl
+                    
+                    trade_logger.info(f"TRAILED PHYSICAL SL (2-Stage): {trade['symbol']} | Old: {rounded_current_sl} | New: {rounded_new_sl} | New SL Order ID: {new_sl_order_id}")
+                    
+                    # 3. Save new sl_price and sl_order_id to DB (Bug Fix 3)
+                    db = SessionLocal()
+                    try:
+                        db_trade = db.query(Trade).filter(Trade.id == trade['id'], Trade.user_id == self.user_id).first()
+                        if db_trade:
+                            db_trade.sl_price = float(rounded_new_sl)
+                            db_trade.sl_order_id = new_sl_order_id
+                            db.commit()
+                            
+                            # Dispatch Telegram Alert
+                            try:
+                                from telegram_alert import alert_trailing_sl_updated
+                                stage = "BREAKEVEN" if rounded_new_sl == entry else "TRAILING"
+                                alert_trailing_sl_updated(trade['symbol'], stage, rounded_current_sl, rounded_new_sl, price)
+                            except Exception as ta_err:
+                                logger.error(f"Failed to send trailing SL alert: {ta_err}")
+                    except Exception as e:
+                        db.rollback()
+                        logger.error(f"Failed to update trailed SL in DB: {e}")
+                    finally:
+                        db.close()
                 else:
-                    logger.error(f"Failed to trail SL physically via Upstox for {trade['symbol']}")
+                    logger.error(f"Failed to place new trailed SL for {trade['symbol']}")
             else:
-                trade_logger.info(f"TRAILED LOCAL SL: {trade['symbol']} (Mult: {trailing_mult}x) | Old: {trade['sl']} | New: {new_sl}")
-                trade['sl'] = new_sl
+                trade_logger.info(f"TRAILED LOCAL SL (2-Stage): {trade['symbol']} | Old: {rounded_current_sl} | New: {rounded_new_sl}")
+                trade['sl'] = rounded_new_sl
+                # Dispatch local trailing alert
+                try:
+                    from telegram_alert import alert_trailing_sl_updated
+                    stage = "BREAKEVEN" if rounded_new_sl == entry else "TRAILING"
+                    alert_trailing_sl_updated(trade['symbol'], stage, rounded_current_sl, rounded_new_sl, price)
+                except Exception as ta_err:
+                    logger.error(f"Failed to send trailing SL alert: {ta_err}")
 
-    def close_trade(self, trade: dict, reason: str):
+    def close_trade(self, trade: dict, reason: str, execution_engine=None):
         trade['status'] = 'CLOSED'
         trade['exit_reason'] = reason
         trade['exit_time'] = get_ist_now().isoformat()
         
-        # Overtrading Control (Phase 4): Consecutive Losses Tracking
-        from config import SystemState
-        if not hasattr(SystemState, 'consecutive_losses'):
-            SystemState.consecutive_losses = 0
+        # Cancel stop loss order on the broker side if execution_engine and sl_order_id are available
+        sl_order_id = trade.get('sl_order_id')
+        if sl_order_id and execution_engine:
+            try:
+                logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
+                execution_engine.cancel_order(sl_order_id)
+            except Exception as e:
+                logger.error(f"Failed to cancel SL order {sl_order_id}: {e}")
+        
+        # Consecutive Losses Tracking (Now isolated by TradeManager instance)
+        if not hasattr(self, 'consecutive_losses'):
+            self.consecutive_losses = 0
             
         if trade['pnl'] < 0:
-            SystemState.consecutive_losses += 1
-            if SystemState.consecutive_losses >= 2:
-                SystemState.loss_cooldown_until = datetime.datetime.now(IST) + datetime.timedelta(minutes=30)
-                logger.warning("2 Consecutive losses hit! Global Cooldown enabled for 30 minutes.")
-        else:
-            if trade['pnl'] > 0:
-                SystemState.consecutive_losses = 0 # reset on win
+            self.consecutive_losses += 1
+            logger.info(f"[USER {self.user_id}] PnL negative. Consecutive losses count: {self.consecutive_losses}")
+        elif trade['pnl'] > 0:
+            self.consecutive_losses = 0
+            logger.info(f"[USER {self.user_id}] PnL positive. Consecutive losses reset to 0.")
+
+        # Update bot state if bot registered
+        from user_bot_registry import get_bot
+        bot = get_bot(self.user_id)
+        if bot:
+            bot.state.consecutive_losses = self.consecutive_losses
+            
+        # If consecutive losses reach 2, pause trading
+        if self.consecutive_losses >= Config.MAX_CONSECUTIVE_LOSSES:
+            from telegram_alert import alert_consecutive_losses
+            if bot:
+                bot.state.is_running = False
+                bot.state.status = "STOPPED"
+                logger.warning(f"[USER {self.user_id}] Pausing bot due to {self.consecutive_losses} consecutive losses.")
+            alert_consecutive_losses(self.user_id)
 
         # Move lists
         self.trade_history.append(trade)
         if trade in self.active_trades:
             self.active_trades.remove(trade)
             
-        logger.info(f"Trade closed: {trade['id']}, Reason: {reason}, PnL: {trade['pnl']}, Consecutive Losses: {getattr(SystemState, 'consecutive_losses', 0)}")
+        logger.info(f"Trade closed: {trade['id']}, Reason: {reason}, PnL: {trade['pnl']}, Consecutive Losses: {self.consecutive_losses}")
         trade_logger.info(f"CLOSED TRADE: [id={trade['id']}, symbol={trade['symbol']}, reason={reason}, final_pnl={trade['pnl']}, exit_price={trade['current_price']}]")
 
         # Update Database
         db = SessionLocal()
         try:
-            db_trade = db.query(Trade).filter(Trade.id == trade['id']).first()
+            db_trade = db.query(Trade).filter(Trade.id == trade['id'], Trade.user_id == self.user_id).first()
             if db_trade:
                 db_trade.status = 'CLOSED'
                 db_trade.exit_price = float(trade['current_price'])
@@ -274,12 +395,16 @@ class TradeManager:
                 db_trade.sl_price = float(trade['sl'])
                 db.commit()
                 
-            # Update Daily Stats aggregate
+            # Update Daily Stats aggregate for THIS user
             today = get_ist_date()
-            stats = db.query(DailyStats).filter(DailyStats.session_date == today).first()
+            stats = db.query(DailyStats).filter(DailyStats.session_date == today, DailyStats.user_id == self.user_id).first()
             if not stats:
+                from database import UserConfig
+                user_cfg = db.query(UserConfig).filter(UserConfig.user_id == self.user_id).first()
+                initial_capital = user_cfg.manual_capital if user_cfg else Config.MANUAL_CAPITAL
                 stats = DailyStats(
-                    session_date=today, start_capital=Config.MANUAL_CAPITAL, end_capital=Config.MANUAL_CAPITAL,
+                    session_date=today, user_id=self.user_id,
+                    start_capital=initial_capital, end_capital=initial_capital,
                     total_trades_taken=0, winning_trades=0, net_realized_pnl=0.0
                 )
                 db.add(stats)

@@ -1,3 +1,0 @@
-@echo off
-echo Starting Intraday Trading System...
-python -m uvicorn main:app --reload --port 8000

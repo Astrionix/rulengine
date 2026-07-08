@@ -40,9 +40,11 @@ _REVERSE_MAP.update({v.replace("|", ":"): k for k, v in Config.SYMBOLS_MAPPING.i
 _prices_cache: Dict[str, float] = {}
 _indices_cache: Dict[str, float] = {}
 _indices_prev_close: Dict[str, float] = {}
+_tick_timestamps: Dict[str, float] = {}
 _last_equity_tick: float = 0
 _last_index_tick: float = 0
 _trade_manager = None
+_shared_creds = None
 
 _stop_event = threading.Event()
 
@@ -50,7 +52,11 @@ _stop_event = threading.Event()
 
 def _get_authorized_url(api_type: str = "market"):
     """Fetches a fresh authorized URL."""
-    token = Config.ANALYTICS_TOKEN if (api_type == "market" and Config.ANALYTICS_TOKEN) else Config.UPSTOX_ACCESS_TOKEN
+    token = None
+    if _shared_creds:
+        token = _shared_creds.get("analytics_token") if (api_type == "market" and _shared_creds.get("analytics_token")) else _shared_creds.get("upstox_access_token")
+    if not token:
+        token = Config.ANALYTICS_TOKEN if (api_type == "market" and Config.ANALYTICS_TOKEN) else Config.UPSTOX_ACCESS_TOKEN
     
     url = f"https://api.upstox.com/{'v3' if api_type == 'market' else 'v2'}/feed/{'market-data-feed' if api_type == 'market' else 'portfolio-stream-feed'}/authorize"
         
@@ -176,6 +182,7 @@ def _on_market_message(message):
                     if "NIFTY BANK" in upper_key: normalized_key = "NSE_INDEX|Nifty Bank"
 
                     _indices_cache[normalized_key] = ltp
+                    _tick_timestamps[normalized_key] = _time.time()
                     if prev_close > 0:
                         _indices_prev_close[normalized_key] = prev_close
                     
@@ -191,6 +198,7 @@ def _on_market_message(message):
                         
                     if human_name:
                         _prices_cache[human_name] = ltp
+                        _tick_timestamps[human_name] = _time.time()
                     
                     global _last_equity_tick
                     _last_equity_tick = _time.time()
@@ -211,7 +219,12 @@ def _market_loop():
         try:
             api_client = upstox_client.ApiClient()
             config = upstox_client.Configuration()
-            config.access_token = Config.ANALYTICS_TOKEN if Config.ANALYTICS_TOKEN else Config.UPSTOX_ACCESS_TOKEN
+            token = None
+            if _shared_creds:
+                token = _shared_creds.get("analytics_token") or _shared_creds.get("upstox_access_token")
+            if not token:
+                token = Config.ANALYTICS_TOKEN if Config.ANALYTICS_TOKEN else Config.UPSTOX_ACCESS_TOKEN
+            config.access_token = token
             api_client.configuration = config
             
             streamer = MarketDataStreamerV3(api_client, instrumentKeys=ALL_INSTRUMENT_KEYS, mode="ltpc")
@@ -244,7 +257,10 @@ def _portfolio_loop():
         try:
             api_client = upstox_client.ApiClient()
             config = upstox_client.Configuration()
-            config.access_token = Config.UPSTOX_ACCESS_TOKEN
+            token = _shared_creds.get("upstox_access_token") if _shared_creds else None
+            if not token:
+                token = Config.UPSTOX_ACCESS_TOKEN
+            config.access_token = token
             api_client.configuration = config
             
             streamer = PortfolioDataStreamer(api_client, order_update=True, position_update=True)
@@ -263,19 +279,31 @@ def _portfolio_loop():
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def start(prices_cache: dict, indices_cache: dict, prev_close_cache: dict = None, trade_manager=None):
-    global _prices_cache, _indices_cache, _indices_prev_close, _trade_manager, _stop_event
+def start(prices_cache: dict, indices_cache: dict, prev_close_cache: dict = None, trade_manager=None, timestamps_cache: dict = None, credentials: dict = None):
+    global _prices_cache, _indices_cache, _indices_prev_close, _trade_manager, _stop_event, _tick_timestamps, _shared_creds
     _prices_cache = prices_cache
     _indices_cache = indices_cache
     if prev_close_cache is not None:
         _indices_prev_close = prev_close_cache
     _trade_manager = trade_manager
+    if timestamps_cache is not None:
+        _tick_timestamps = timestamps_cache
+    else:
+        _tick_timestamps = {}
+    _shared_creds = credentials
     _stop_event.clear()
 
     _patch_sdk()
 
     threading.Thread(target=_market_loop, daemon=True, name="MktWS").start()
-    if Config.UPSTOX_ACCESS_TOKEN:
+    
+    has_access_token = False
+    if credentials and credentials.get("upstox_access_token"):
+        has_access_token = True
+    elif Config.UPSTOX_ACCESS_TOKEN:
+        has_access_token = True
+
+    if has_access_token:
         threading.Thread(target=_portfolio_loop, daemon=True, name="PortWS").start()
     logger.info("[WS] Dedicated Market & Portfolio threads launched.")
 
@@ -291,3 +319,53 @@ def is_equity_live():
 
 def is_index_live():
     return (_time.time() - _last_index_tick) < 5
+
+# ─── Bug Fix 4: Stale Feed Helpers ───────────────────────────────────────────
+
+def is_tick_fresh(symbol: str, max_age: float = 30.0) -> bool:
+    """Check if the last tick for a symbol is within the allowed freshness window.
+    Returns True if tick is fresh (within max_age seconds), False otherwise.
+    Used by Layer 3, Layer 4, order placement, and trade monitoring."""
+    last_tick = _tick_timestamps.get(symbol, 0.0)
+    if last_tick == 0.0:
+        return False
+    return (_time.time() - last_tick) < max_age
+
+def get_tick_age(symbol: str) -> float:
+    """Return age of last tick in seconds. Returns -1 if no tick ever received."""
+    last_tick = _tick_timestamps.get(symbol, 0.0)
+    if last_tick == 0.0:
+        return -1.0
+    return _time.time() - last_tick
+
+def get_feed_health_summary() -> dict:
+    """Return feed health status for dashboard indicator.
+    Green: all symbols fresh (<15s), Yellow: some 15-30s, Red: majority >30s or disconnected."""
+    if not _tick_timestamps:
+        return {"status": "red", "fresh": 0, "stale": 0, "dead": 0, "total": 0}
+    
+    now = _time.time()
+    fresh = stale = dead = 0
+    for sym, ts in _tick_timestamps.items():
+        age = now - ts
+        if age < 15:
+            fresh += 1
+        elif age < 30:
+            stale += 1
+        else:
+            dead += 1
+    
+    total = fresh + stale + dead
+    if dead > total * 0.5 or not is_live():
+        status = "red"
+    elif stale > 0 or dead > 0:
+        status = "yellow"
+    else:
+        status = "green"
+    
+    return {"status": status, "fresh": fresh, "stale": stale, "dead": dead, "total": total}
+
+def get_all_tick_timestamps() -> dict:
+    """Return a copy of all tick timestamps for external use."""
+    return dict(_tick_timestamps)
+

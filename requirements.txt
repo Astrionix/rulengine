@@ -8,3 +8,15 @@ requests
 upstox-python-sdk
 websocket-client
 protobuf
+sqlalchemy
+pymysql
+pytz
+pydantic
+python-dotenv
+cryptography
+groq
+bcrypt
+python-multipart
+anthropic
+scipy
+aiohttp

@@ -1,26 +1,62 @@
-from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, BackgroundTasks, Request, Depends, HTTPException, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
+import time as _time
 import logging
+import math
 import pandas as pd
 from datetime import datetime, time
 import pytz
 
 IST = pytz.timezone('Asia/Kolkata')
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+# ── Auth imports ──────────────────────────────────────────────────────────────
+from auth import (
+    authenticate_user, create_access_token, create_refresh_token,
+    verify_refresh_token, revoke_access_token, revoke_refresh_token,
+    is_rate_limited, record_login_attempt, clear_login_attempts,
+    ACCESS_TOKEN_EXP, REFRESH_TOKEN_EXP,
+    get_user_by_id, create_user, verify_access_token, hash_password
+)
+from auth_middleware import require_auth, require_admin, get_token_from_request
 
 # Local imports
 from config import Config, SystemState
 from features import compute_features
-from strategy import generate_signals
-from ai_filter import analyze_trade
 from trade_manager import TradeManager
 from execution import UpstoxExecutionEngine
 import market_feed
-from database import SessionLocal, Trade
+from database import (
+    SessionLocal, Trade, get_db,
+    get_global_trading_enabled, set_global_trading_enabled,
+    is_symbol_blacklisted, add_to_daily_blacklist, get_daily_blacklist,
+    get_trades_count_today
+)
 from sqlalchemy import desc
+from dual_strategy_engine import DualStrategyEngine
+from user_bot_registry import get_or_create_bot, get_bot, reload_bot_credentials
+from credential_service import upsert_credentials, credential_field_status, has_credentials
+
+# ── v2 Pipeline imports ──────────────────────────────────────────────────────
+from pipeline_layer1 import MorningPreFilter
+from pipeline_layer2 import WatchlistRefresh
+from pipeline_layer3 import SignalScanner
+from pipeline_layer4 import FeatureExtractor
+from pipeline_layer5 import ClaudeAnalyzer
+from telegram_alert import (
+    send_telegram, send_telegram_async,
+    alert_bot_startup, alert_trade_entry, alert_trade_exit,
+    alert_consecutive_losses, alert_daily_limit_reached,
+    alert_order_status_unknown, alert_global_halt_activated,
+    alert_global_halt_lifted, alert_watchlist_refreshed,
+    alert_stale_feed
+)
+from daily_summary import generate_daily_summary
+from reconciliation import run_reconciliation
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,570 +69,2058 @@ logging.Formatter.converter = ist_converter
 
 app = FastAPI(title="Intraday Trading System API")
 
+# ── CORS (tighten origins in production) ──────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # Replace with specific domain in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Mount static folder for UI
 import os
 os.makedirs("frontend", exist_ok=True)
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
-state = SystemState()
-trade_manager = TradeManager()
-execution_engine = UpstoxExecutionEngine()
+# ── Shared market-feed state (indices/prices are not user-specific) ──────────
+# Each user's bot reads from these shared caches for market data.
+# Bot execution (orders, state, SL) is fully per-user via user_bot_registry.
+_shared_state     = SystemState()      # live_indices, index_prev_close only
+_shared_prices    = {}                 # live LTP cache for all symbols
+_shared_timestamps = {}                # tick timestamps to track feed freshness
+_shared_engine    = UpstoxExecutionEngine()  # for shared market-feed + index fetching
+
+# ── v2 Pipeline state (per-user instances stored in UserBot, shared instances here) ──
+_signal_log: list = []   # Last 50 signal log entries for dashboard
+_signal_log_cleared_date = None  # Track date when signal log was cleared at 9:15 AM
+_pipeline_stats = {      # Pipeline stats for daily summary
+    "stocks_scanned": 0,
+    "layer3_signals": 0,
+    "claude_enters": 0,
+    "claude_calls": 0,
+}
+
 
 # In-memory state
 prev_prices_for_momentum: dict = {}
+latest_signals: list = []
 
-# Track latest signals for the UI
-latest_signals = []
-live_prices_cache = {}
+def send_alert(user_id: Optional[int], message: str):
+    """Logs a critical alert and sends to Telegram."""
+    prefix = f"[USER {user_id}] " if user_id else "[SYSTEM] "
+    alert_msg = f"🔔 ALERT: {prefix}{message}"
+    logger.critical(alert_msg)
+    send_telegram(alert_msg)
+
+def _db():
+    """Return a DB session for use outside of FastAPI dependency injection."""
+    return next(get_db())
+
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Initializing Intelligence and Trading System...")
-    # Connect to Upstox REST API (profile check)
-    execution_engine.connect()
-    
-    # Initialize state with real data immediately
+    logger.info("Initializing Multi-User Trading System v2...")
+    # Initialize DB tables (creates users, user_credentials, v2 pipeline tables, etc.)
+    from database import init_db
+    init_db()
+
+    # Load first available credentials from DB for the shared engine / feed
+    shared_creds = None
+    db = _db()
+    try:
+        from database import UserCredential
+        from credential_service import get_decrypted_credentials
+        cred_row = db.query(UserCredential).filter(UserCredential.upstox_access_token != None).first()
+        if cred_row:
+            logger.info(f"Loading shared credentials from user_id={cred_row.user_id}...")
+            shared_creds = get_decrypted_credentials(db, cred_row.user_id)
+            _shared_engine._creds = shared_creds
+    except Exception as e:
+        logger.error(f"Error loading startup credentials: {e}")
+    finally:
+        db.close()
+
+    # Connect shared engine for market data / index feeds
+    _shared_engine.connect()
+
+    # Initial index fetch using shared engine
     try:
         logger.info("Performing initial data fetch...")
-        state.active_capital = execution_engine.get_funds()
-        # Initial index fetch
         idx_keys = [
             "NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "NSE_INDEX|Nifty Bank",
             "NSE_INDEX|Nifty Fin Service", "NSE_INDEX|NIFTY MID SELECT", "NSE_INDEX|India VIX"
         ]
-        res = execution_engine.get_market_quotes(idx_keys)
+        res = _shared_engine.get_market_quotes(idx_keys)
         for idx in idx_keys:
-            # Match both pipe and colon versions
             key_in_res = idx if idx in res else idx.replace("|", ":")
             if key_in_res in res:
                 quote = res[key_in_res]
-                state.live_indices[idx] = quote['last_price']
-                # For indices, net_change is more reliable to find prev_close
+                _shared_state.live_indices[idx] = quote['last_price']
                 if 'net_change' in quote:
-                    state.index_prev_close[idx] = quote['last_price'] - quote['net_change']
+                    _shared_state.index_prev_close[idx] = quote['last_price'] - quote['net_change']
                 elif 'ohlc' in quote and 'close' in quote['ohlc']:
-                    state.index_prev_close[idx] = quote['ohlc']['close']
-        logger.info(f"Initial capital: ₹{state.active_capital}, Indices: {len(state.live_indices)} fetched.")
+                    _shared_state.index_prev_close[idx] = quote['ohlc']['close']
+        logger.info(f"Indices loaded: {len(_shared_state.live_indices)} fetched.")
     except Exception as e:
         logger.error(f"Error during initial fetch: {e}")
 
-    # ── Launch WebSocket real-time market feed (background daemon thread) ──
-    market_feed.start(live_prices_cache, state.live_indices, state.index_prev_close, trade_manager)
+    # Launch WebSocket market feed (shared — serves all users)
+    market_feed.start(
+        _shared_prices, 
+        _shared_state.live_indices, 
+        _shared_state.index_prev_close, 
+        None, 
+        _shared_timestamps,
+        credentials=shared_creds
+    )
     logger.info("[WS] Upstox WebSocket Market Feed started.")
-    # Start background task loops
-    asyncio.create_task(trading_cycle_loop())
     asyncio.create_task(ws_fallback_pump())
     asyncio.create_task(periodic_stat_sync())
 
+    # Auto-resume bots that were running before the server restarted
+    db_resume = _db()
+    try:
+        from database import UserConfig, UserCredential
+        running_configs = db_resume.query(UserConfig).filter(UserConfig.is_running == 1).all()
+        for r_cfg in running_configs:
+            uid = r_cfg.user_id
+            # Verify they have credentials set
+            creds = db_resume.query(UserCredential).filter(UserCredential.user_id == uid).first()
+            if creds and creds.upstox_access_token:
+                bot = get_or_create_bot(uid, db_resume)
+                bot.state.is_running = True
+                bot.state.status = "RUNNING"
+                await ensure_user_bot_task(uid, db_resume)
+                logger.info(f"[Startup] Auto-resumed running trading cycle task for user_id={uid}")
+    except Exception as e:
+        logger.error(f"[Startup] Error auto-resuming user bots: {e}")
+    finally:
+        db_resume.close()
+
 async def periodic_stat_sync():
     """
-    Independent task to sync capital and indices every 5 minutes, 
-    even when the market is closed or trading is paused.
+    Sync shared indices every 5 minutes (not user-specific).
+    Per-user capital is synced inside each user's trading cycle.
     """
     while True:
         try:
-            # Sync Capital (only every 5 mins to avoid spamming)
-            new_cap = execution_engine.get_funds()
-            if new_cap > 0:
-                state.active_capital = new_cap
-            
-            # Sync Indices
             idx_keys = [
                 "NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "NSE_INDEX|Nifty Bank",
                 "NSE_INDEX|Nifty Fin Service", "NSE_INDEX|NIFTY MID SELECT", "NSE_INDEX|India VIX"
             ]
-            res = execution_engine.get_market_quotes(idx_keys)
+            res = _shared_engine.get_market_quotes(idx_keys)
             for idx in idx_keys:
                 key_in_res = idx if idx in res else idx.replace("|", ":")
                 if key_in_res in res:
                     quote = res[key_in_res]
-                    state.live_indices[idx] = quote['last_price']
+                    _shared_state.live_indices[idx] = quote['last_price']
                     if 'net_change' in quote:
-                        state.index_prev_close[idx] = quote['last_price'] - quote['net_change']
+                        _shared_state.index_prev_close[idx] = quote['last_price'] - quote['net_change']
                     elif 'ohlc' in quote and 'close' in quote['ohlc']:
-                        state.index_prev_close[idx] = quote['ohlc']['close']
-            
-            logger.info(f"[Sync] Capital: ₹{state.active_capital}")
+                        _shared_state.index_prev_close[idx] = quote['ohlc']['close']
+            logger.info(f"[Sync] Indices updated: {len(_shared_state.live_indices)}")
         except Exception as e:
             logger.error(f"[Sync] Error: {e}")
-            
-        await asyncio.sleep(300) # Every 5 minutes
+        await asyncio.sleep(300)
 
 async def ws_fallback_pump():
     """
-    Enhanced fallback: 
-    1. If no indices for 5s -> Poll indices every 3s (High frequency fallback)
-    2. If no equities for 30s -> Poll everything every 30s
+    Fallback REST polling for indices/equities when WebSocket is stale.
     """
     while True:
-        await asyncio.sleep(3) # Check every 3 seconds
-        
-        # High-frequency Index Fallback
+        await asyncio.sleep(3)
+
         if not market_feed.is_index_live():
             idx_keys = [
                 "NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX", "NSE_INDEX|Nifty Bank",
                 "NSE_INDEX|Nifty Fin Service", "NSE_INDEX|NIFTY MID SELECT", "NSE_INDEX|India VIX"
             ]
             try:
-                res = execution_engine.get_ltp_bulk(idx_keys)
+                res = _shared_engine.get_ltp_bulk(idx_keys)
                 for idx in idx_keys:
                     if idx in res:
-                        state.live_indices[idx] = res[idx]
+                        _shared_state.live_indices[idx] = res[idx]
             except Exception as e:
                 logger.debug(f"[Fallback] Index REST error: {e}")
 
-        # General Equity Fallback (Gentle)
         if not market_feed.is_equity_live():
             try:
                 keys = list(Config.SYMBOLS_MAPPING.values())
-                res = execution_engine.get_ltp_bulk(keys)
+                res = _shared_engine.get_ltp_bulk(keys)
                 for ticker, ltp in res.items():
-                    live_prices_cache[ticker] = ltp
+                    _shared_prices[ticker] = ltp
             except Exception as e:
                 logger.warning(f"[Fallback] Equity REST error: {e}")
 
-# Removed mock data generator. Relying exclusively on real execution engine for data.
-async def trading_cycle_loop():
+def run_local_rule_analysis(feature_payloads: list) -> list:
     """
-    Runs every minute to fetch data, evaluate strategy, and manage trades.
+    Programmatic fallback when Generative AI filter is disabled.
+    Applies the exact same entry, SL, target, and skip rules as Claude Analyzer in Python.
     """
-    while True:
-        start_time = datetime.now(IST)
+    decisions = []
+    for payload in feature_payloads:
+        symbol = payload["symbol"]
+        direction = payload["signal_direction"]
+        ltp = payload["price_context"]["ltp"]
+        atr = payload["price_context"]["atr_14_5min"]
+        support = payload["levels"]["support_20bar_5min"]
+        resistance = payload["levels"]["resistance_20bar_5min"]
         
-        if not state.is_running or state.kill_switch_active:
+        # 1. Entry price calculation (with buffer: 0.075%)
+        if direction == "LONG":
+            entry_price = round(ltp * 1.00075, 2)
+            stop_loss = round(support * 0.999, 2)
+        else:
+            entry_price = round(ltp * 0.99925, 2)
+            stop_loss = round(resistance * 1.001, 2)
+            
+        risk = abs(entry_price - stop_loss)
+        
+        # 2. Risk check & SL widening (to 1x ATR if too close)
+        min_risk = entry_price * 0.003
+        if risk < min_risk:
+            if direction == "LONG":
+                stop_loss = round(entry_price - atr, 2)
+            else:
+                stop_loss = round(entry_price + atr, 2)
+            risk = abs(entry_price - stop_loss)
+            
+        # 3. Target calculation (1.5x R:R minimum)
+        if direction == "LONG":
+            target = round(entry_price + (1.5 * risk), 2)
+        else:
+            target = round(entry_price - (1.5 * risk), 2)
+            
+        # 4. Mandatory skip checks
+        decision_val = "ENTER"
+        reason = "Local rules: setup meets all quantitative criteria."
+        red_flags = []
+        
+        price_vs_vwap = payload["price_context"]["price_vs_vwap_pct"]
+        dist_to_res = payload["levels"]["distance_to_resistance_pct"]
+        dist_to_sup = payload["levels"]["distance_to_support_pct"]
+        volume_trend = payload["volume"]["volume_trend"]
+        vol_ratio = payload["volume"]["vol_ratio_6bar_5min"]
+        rsi_14_daily = payload["momentum"]["rsi_14_daily"]
+        
+        # Rule 2: price vs VWAP check
+        if direction == "LONG" and price_vs_vwap <= 0:
+            decision_val = "SKIP"
+            reason = "Price is below VWAP for LONG setup."
+            red_flags.append("below VWAP")
+        elif direction == "SHORT" and price_vs_vwap >= 0:
+            decision_val = "SKIP"
+            reason = "Price is above VWAP for SHORT setup."
+            red_flags.append("above VWAP")
+            
+        # Rule 3: Support/Resistance proximity check
+        if direction == "LONG" and dist_to_res < 0.3:
+            decision_val = "SKIP"
+            reason = "Too close to resistance."
+            red_flags.append("near resistance")
+        elif direction == "SHORT" and dist_to_sup < 0.3:
+            decision_val = "SKIP"
+            reason = "Too close to support."
+            red_flags.append("near support")
+            
+        # Rule 4: SL wider than 1.5x ATR check
+        if risk > 1.5 * atr:
+            decision_val = "SKIP"
+            reason = "Stop-loss wider than 1.5x ATR."
+            red_flags.append("risk too large")
+            
+        # Rule 5: Volume contracting check
+        if volume_trend == "contracting" and vol_ratio < 1.5:
+            decision_val = "SKIP"
+            reason = "Volume contracting and volume ratio too low."
+            red_flags.append("volume declining")
+            
+        # 5. Confidence scoring
+        confidence = 3
+        if vol_ratio >= 2.5:
+            confidence += 1
+        nifty_trend = payload["market_context"]["nifty_trend_today"]
+        if (direction == "LONG" and nifty_trend == "bullish") or (direction == "SHORT" and nifty_trend == "bearish"):
+            confidence += 1
+            
+        rs = payload["market_context"]["stock_vs_nifty_5day_pct"]
+        if direction == "LONG" and rs < 0:
+            confidence -= 1
+            red_flags.append("weak relative strength")
+        elif direction == "SHORT" and rs > 0:
+            confidence -= 1
+            red_flags.append("strong relative strength against short")
+            
+        if direction == "LONG" and rsi_14_daily > 72:
+            confidence -= 1
+            red_flags.append("extended daily RSI")
+        elif direction == "SHORT" and rsi_14_daily < 28:
+            confidence -= 1
+            red_flags.append("oversold daily RSI")
+            
+        confidence = max(1, min(5, confidence))
+        if confidence < 3:
+            decision_val = "SKIP"
+            reason = f"Confidence score too low ({confidence}/5)."
+            
+        decisions.append({
+            "symbol": symbol,
+            "decision": decision_val,
+            "direction": direction,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "target": target,
+            "confidence": confidence,
+            "reasoning": reason,
+            "red_flags": ",".join(red_flags) if red_flags else "none"
+        })
+    return decisions
+
+# ────────────────────────────────────────────────────────────────────────────
+# PER-USER TRADING CYCLE (v2 Pipeline-Based)
+# ────────────────────────────────────────────────────────────────────────────
+
+async def user_trading_cycle(user_id: int):
+    """
+    Per-user trading cycle — v2 pipeline-based.
+    Runs as its own asyncio Task. Implements the full daily schedule (Section 7).
+    """
+    global _signal_log, _pipeline_stats
+
+    from user_bot_registry import get_bot
+    bot = get_bot(user_id)
+    if not bot:
+        logger.error(f"[USER {user_id}] Bot not initialized. Cannot start cycle.")
+        return
+
+    logger.info(f"[USER {user_id}] v2 Pipeline trading cycle started.")
+    
+    # ── Initialize pipeline components ────────────────────────────────────
+    layer1 = MorningPreFilter(bot.engine)
+    layer2 = WatchlistRefresh(bot.engine, user_id=user_id)
+    layer3 = SignalScanner(user_id=user_id)
+    layer4 = FeatureExtractor(bot.engine)
+    layer5 = ClaudeAnalyzer()
+    from pipeline_orb import OpeningRangeBreakout
+    orb    = OpeningRangeBreakout(user_id=user_id)
+
+    # Track daily state
+    layer1_done = False
+    last_layer2_refresh = 0.0  # Timestamp of last 15-minute watchlist refresh
+    daily_summary_sent = False
+    reconciliation_done = False
+    ws_disconnected = False
+    orb_obs_complete = False   # ORB: True once 9:30 AM observation window closes
+    orb_last_scan    = 0.0     # ORB: timestamp of last 1-min breakout scan
+    last_l3_scan     = 0.0     # Momentum: timestamp of last 5-min Layer 3-5 scan
+    
+    # Recovery: Load watchlist from DB if restarting mid-day
+    now = datetime.now(IST)
+    current_date = now.date()
+    last_token = bot.creds.get("upstox_access_token") if (bot and bot.creds) else None
+    if now.hour >= 9:
+        existing_watchlist = layer2.load_active_watchlist()
+        if existing_watchlist:
+            logger.info(f"[USER {user_id}] Recovered {len(existing_watchlist)} active watchlist stocks from DB.")
+            layer1_done = True  # Skip Layer 1 if watchlist exists
+            if now.time() >= time(9, 30):
+                try:
+                    orb.recover_ranges_from_candles(layer2.active_watchlist, bot.engine)
+                    orb_obs_complete = True
+                except Exception as ex:
+                    logger.error(f"[USER {user_id}] Failed to recover ORB ranges on startup: {ex}")
+        elif now.hour >= 10:
+            # Past 9 AM, try loading morning watchlist
+            morning = MorningPreFilter.load_from_db()
+            if morning:
+                layer1.watchlist = morning
+                layer2.active_watchlist = [{"symbol": s["symbol"], "instrument_key": s["instrument_key"], 
+                                           "direction_bias": s["direction_bias"]} for s in morning]
+                layer1_done = True
+                logger.info(f"[USER {user_id}] Recovered {len(morning)} morning watchlist stocks from DB.")
+                if now.time() >= time(9, 30):
+                    try:
+                        orb.recover_ranges_from_candles(layer2.active_watchlist, bot.engine)
+                        orb_obs_complete = True
+                    except Exception as ex:
+                        logger.error(f"[USER {user_id}] Failed to recover ORB ranges on startup: {ex}")
+
+    while True:
+        bot = get_bot(user_id)  # re-fetch in case of hot-reload
+        if not bot:
+            break
+
+        # Check if Upstox token was refreshed/updated mid-day
+        current_token = bot.creds.get("upstox_access_token") if (bot and bot.creds) else None
+        if current_token and current_token != last_token:
+            logger.info(f"[USER {user_id}] Detected token update mid-day. Resetting Layer 1 flag to allow watchlist rebuild.")
+            last_token = current_token
+            if not layer1.watchlist:
+                layer1_done = False
+
+        now = datetime.now(IST)
+
+        # Clear previous day's signal log and daily pipeline stats at 9:15 AM on trading days
+        global _signal_log, _pipeline_stats, _signal_log_cleared_date
+        if now.time() >= time(9, 15) and _signal_log_cleared_date != now.date():
+            logger.info(f"[USER {user_id}] 9:15 AM reached. Clearing yesterday's live signal logs and daily pipeline stats.")
+            _signal_log = []
+            _pipeline_stats = {
+                "stocks_scanned": 0,
+                "layer3_signals": 0,
+                "claude_enters": 0,
+                "claude_calls": 0,
+            }
+            _signal_log_cleared_date = now.date()
+
+        # Reset daily state on a new calendar day
+        if now.date() != current_date:
+            logger.info(f"[USER {user_id}] New day detected ({now.date()}). Resetting daily pipeline flags.")
+            layer1_done = False
+            last_layer2_refresh = 0.0
+            daily_summary_sent = False
+            reconciliation_done = False
+            ws_disconnected = False
+            orb_obs_complete = False
+            orb.reset()
+            
+            # Reset VIX alert flags for the new day
+            try:
+                from telegram_alert import reset_vix_alerts
+                reset_vix_alerts()
+            except Exception as reset_err:
+                logger.error(f"Error resetting VIX alerts: {reset_err}")
+                
+            current_date = now.date()
+
+        # ── Per-user controls ─────────────────────────────────────────────
+        if not bot.state.is_running or bot.state.kill_switch_active:
             await asyncio.sleep(10)
             continue
-            
-        now = datetime.now(IST)
-        market_open = time(9, 15)
-        market_close = time(15, 15)
-        
-        # MARKET TIME CONTROL (9:15 AM to 3:15 PM IST)
-        if not (market_open <= now.time() <= market_close):
-            if Config.MODE == 'LIVE':
-                logger.info(f"Market Closed (IST: {now.strftime('%H:%M:%S')}). Waiting for active market hours (09:15 - 15:15)...")
-                await asyncio.sleep(60)
-                continue
 
-        # ── OPENING RANGE LOCK: No trades before 9:30 AM ────────────────────
-        trading_start = time(9, 30)
-        if now.time() < trading_start and Config.MODE == 'LIVE':
-            logger.info(f"Opening range forming (9:15-9:30 IST: {now.strftime('%H:%M:%S')}). No trades. Waiting...")
-            await asyncio.sleep(60)
+        logger.info(f"[USER {user_id}] Heartbeat: Trading cycle active. Trades: {len(bot.tm.active_trades)}, Watchlist: {len(layer2.active_watchlist)}")
+
+        # ── Trade monitoring runs ALWAYS (even during halt) — Bug Fix 7 ───
+        # Active position monitoring continues regardless of global halt
+        if bot.tm.active_trades:
+            vix_ltp = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+            nifty_ltp = _shared_state.live_indices.get("NSE_INDEX|Nifty 50", 0)
+            bot.state.market_condition = "VOLATILE" if vix_ltp > 18 else ("SIDEWAYS" if vix_ltp < 12 else "TRENDING")
+            
+            # Update prices for active trades
+            name_to_ltp = {}
+            for sym_name, sym_key in Config.SYMBOLS_MAPPING.items():
+                if sym_name in _shared_prices:
+                    name_to_ltp[sym_name] = _shared_prices[sym_name]
+                elif sym_key in _shared_prices:
+                    name_to_ltp[sym_name] = _shared_prices[sym_key]
+            bot.tm.update_prices(name_to_ltp, bot.engine)
+
+        # ── 08:55 AM — Token verification ─────────────────────────────────
+        if now.hour == 8 and now.minute == 55:
+            logger.info(f"[USER {user_id}] 8:55 AM — Verifying Upstox API token validity...")
+            is_valid = bot.engine.connect()
+            if not is_valid:
+                retry_count = 0
+                while not is_valid and retry_count < 2:
+                    logger.warning(f"[USER {user_id}] Upstox token invalid. Retrying connection (Attempt {retry_count + 1})...")
+                    reload_bot_credentials(user_id, _db())
+                    bot = get_bot(user_id)
+                    is_valid = bot.engine.connect()
+                    retry_count += 1
+                    await asyncio.sleep(2)
+                
+                if not is_valid:
+                    from telegram_alert import alert_token_refresh_failed
+                    alert_token_refresh_failed()
+                    logger.critical(f"[USER {user_id}] Upstox token verification failed at 8:55 AM. Aborting startup.")
+                    bot.state.is_running = False
+                    continue
+            logger.info(f"[USER {user_id}] Upstox token verified successfully.")
+
+            # Restart WebSocket feed for the new day if it was stopped
+            if market_feed._stop_event.is_set():
+                logger.info(f"[USER {user_id}] Restarting WebSocket Feed for the new day...")
+                market_feed.start(
+                    _shared_prices, 
+                    _shared_state.live_indices, 
+                    _shared_state.index_prev_close, 
+                    None, 
+                    _shared_timestamps,
+                    credentials=bot.creds
+                )
+
+        # ── 09:00 AM — Layer 1: Morning Pre-Filter ───────────────────────
+        if not layer1_done and now.hour >= 9:
+            try:
+                logger.info(f"[USER {user_id}] Running Layer 1 morning pre-filter...")
+                watchlist = layer1.run()
+                layer2.active_watchlist = [{"symbol": s["symbol"], "instrument_key": s["instrument_key"],
+                                           "direction_bias": s["direction_bias"]} for s in watchlist]
+                layer1_done = True
+                alert_bot_startup(now.strftime("%d-%b-%Y"), [s["symbol"] for s in watchlist])
+                logger.info(f"[USER {user_id}] Layer 1 complete. {len(watchlist)} stocks in morning watchlist.")
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Layer 1 failed: {e}")
+                layer1_done = True  # Don't retry infinitely
+
+        # ── 09:15 AM+ — Market hours logic ────────────────────────────────
+        if now.time() < time(9, 15):
+            await asyncio.sleep(30)
             continue
-            
-        logger.info(f"[{Config.MODE}] Running trading cycle...")
-        
-        # Refresh capital and indices for the pulse
-        state.active_capital = execution_engine.get_funds()
-        
-        # ── GLOBAL MARKET PULSE ──────────────────────────────────────────────
-        nifty_ltp = state.live_indices.get("NSE_INDEX|Nifty 50", 0)
-        vix_ltp = state.live_indices.get("NSE_INDEX|India VIX", 0)
-        
-        if nifty_ltp > 0:
-            # We use a simple sentiment based on VIX and direction
-            if vix_ltp > 18:
-                state.market_condition = "VOLATILE"
-            elif vix_ltp < 12:
-                state.market_condition = "SIDEWAYS"
-            else:
-                state.market_condition = "TRENDING"
-        else:
-            state.market_condition = "WAITING"
 
-        current_prices = {}
-        global latest_signals, prev_prices_for_momentum
-        new_signals = []
+        # ── ORB Phase 1: Observation window (9:15 AM – 9:30 AM) ─────────
+        if not orb_obs_complete and time(9, 15) <= now.time() < time(9, 30):
+            if layer2.active_watchlist:
+                orb.observe(layer2.active_watchlist, _shared_prices)
 
-        # ── STAGE 1: Bulk LTP fetch for ALL 100 stocks (1 API call) ─────────
-        all_keys = list(Config.SYMBOLS_MAPPING.values())
-        all_ltps_raw = execution_engine.get_ltp_bulk(all_keys)
+        # ── ORB Phase 1 → 2 transition: mark complete at 9:30 AM ────────
+        if not orb_obs_complete and now.time() >= time(9, 30):
+            orb.mark_observation_complete()
+            orb_obs_complete = True
 
-        # Build name→ltp map
-        name_to_ltp = {}
-        for sym_name, sym_key in Config.SYMBOLS_MAPPING.items():
-            if sym_key in all_ltps_raw:
-                name_to_ltp[sym_name] = all_ltps_raw[sym_key]
-
-        # ── STAGE 2: Filter by Price Range & Rank top 15 movers ──────
-        valid_movers = []
-        for name, ltp in name_to_ltp.items():
-            if Config.MIN_STOCK_PRICE <= ltp <= Config.MAX_STOCK_PRICE:
-                delta = abs(ltp - prev_prices_for_momentum.get(name, ltp))
-                valid_movers.append((name, delta))
+            # --- Addition 1: Opening 15-min volume day classifier ---
+            try:
+                logger.info(f"[USER {user_id}] Calculating 15-min volume participation...")
+                total_expected_15min_vol = 0
+                total_actual_15min_vol = 0
+                for s in layer2.active_watchlist:
+                    avg_vol = s.get("avg_vol_20", 0)
+                    if avg_vol > 0:
+                        total_expected_15min_vol += avg_vol * (15 / 375)
+                        
+                        df = bot.engine.get_ohlc(s["instrument_key"], interval="5minute")
+                        if not df.empty:
+                            df['ist_time'] = df['timestamp'].dt.tz_convert('Asia/Kolkata') if df['timestamp'].dt.tz else df['timestamp'].dt.tz_localize('Asia/Kolkata')
+                            mask = (df['ist_time'].dt.time >= time(9, 15)) & (df['ist_time'].dt.time < time(9, 30))
+                            actual_vol = df.loc[mask, 'volume'].sum()
+                            total_actual_15min_vol += actual_vol
                 
-        movers = sorted(valid_movers, key=lambda x: x[1], reverse=True)
-
-        # Update momentum cache for next cycle (all symbols)
-        prev_prices_for_momentum = dict(name_to_ltp)
-
-        scan_targets = [m[0] for m in movers] if movers else list(Config.SYMBOLS_MAPPING.keys())
-        
-        # ── STAGE 3: Pulse existing trades with latest LTPs ────────────────
-        trade_manager.update_prices(name_to_ltp, execution_engine)
-        
-        logger.info(f"Scanning {len(scan_targets)} stocks in full universe...")
-
-        for symbol_name in scan_targets:
-            symbol_key = Config.SYMBOLS_MAPPING.get(symbol_name)
-            if not symbol_key:
-                continue
-
-            await asyncio.sleep(0.15)  # Throttled for safety with 90+ stocks
-
-            # 1. Fetch 5m OHLCV Data from Upstox
-            df = execution_engine.get_ohlc(symbol_key, interval="5minute")
-            ltp = name_to_ltp.get(symbol_name, 0.0)
-
-            if df.empty or ltp == 0.0:
-                logger.warning(f"Could not fetch real data for {symbol_name}. Skipping this cycle.")
-                continue
-            
-            # Store latest close for PnL update
-            current_prices[symbol_name] = ltp
-            
-            # 2. Compute Features
-            df_features = compute_features(df)
-            
-            # 3. Strategy & Scoring Engine
-            signal_data = generate_signals(df_features)
-            
-            prob = 0.0
-            decision = signal_data['decision']
-            final_decision = 'AVOID'
-            
-            # 4. Filter with Multi-Timeframe (MTF) Alignment
-            mtf_approved = True
-            macro_trend = "NONE"
-            if signal_data['score'] >= Config.SCORE_THRESHOLD and decision in ['BUY', 'SELL']:
-                logger.info(f"[{symbol_name}] Pre-Signal detected ({decision}). Checking 60-Min MTF Alignment...")
-                df_60m = execution_engine.get_ohlc(symbol_key, interval="60minute")
-                if not df_60m.empty and len(df_60m) >= 2:
-                    last_1h = df_60m.iloc[-2] # Always use COMPLETED candle
-                    macro_trend = "BULLISH" if last_1h['close'] > last_1h['open'] else "BEARISH"
-                    
-                    if decision == "BUY" and macro_trend == "BEARISH":
-                        mtf_approved = False
-                        logger.warning(f"[{symbol_name}] MTF REJECT: 1-hour trend is BEARISH. Skipping BUY.")
-                    elif decision == "SELL" and macro_trend == "BULLISH":
-                        mtf_approved = False
-                        logger.warning(f"[{symbol_name}] MTF REJECT: 1-hour trend is BULLISH. Skipping SELL.")
-            
-            # 5. Execute Groq AI Check
-            if signal_data['score'] >= Config.SCORE_THRESHOLD and mtf_approved:
-                if Config.USE_GROQ_FILTER:
-                    logger.info(f"Injecting {symbol_name} signal into Groq AI Check...")
-                    ai_decision = analyze_trade(df_features.iloc[-2].to_dict())
-                    
-                    if ai_decision in ["AVOID", "WEAK"]:
-                        logger.info(f"[{symbol_name}] SKIPPED: AI filter returned {ai_decision}")
-                        final_decision = "AVOID"
+                if total_expected_15min_vol > 0:
+                    participation_ratio = total_actual_15min_vol / total_expected_15min_vol
+                    if participation_ratio < 0.8:
+                        bot.state.day_type = "LOW_PARTICIPATION"
+                    elif participation_ratio > 2.0:
+                        bot.state.day_type = "HIGH_PARTICIPATION"
                     else:
-                        final_decision = decision
-                else:
-                    final_decision = decision # TRADE strictly on rule engine!
-            elif signal_data['score'] < Config.SCORE_THRESHOLD and decision in ['BUY', 'SELL']:
-                logger.info(f"[{symbol_name}] SKIPPED: Score ({signal_data['score']}) below threshold ({Config.SCORE_THRESHOLD})")
-            signal_record = {
-                'symbol': symbol_name,
-                'instrument_token': symbol_key,
-                'decision': final_decision,
-                'raw_signal': decision,
-                'score': signal_data['score'],
-                'probability': prob,
-                'entry_price': signal_data['current_price'],
-                'sl': signal_data['sl'],
-                'target': signal_data['target'],
-                'metadata': signal_data.get('metadata', {})
-            }
-            new_signals.append(signal_record)
+                        bot.state.day_type = "NORMAL"
+                    logger.info(f"[USER {user_id}] 15-min Participation Ratio: {participation_ratio:.2f} -> {bot.state.day_type}")
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Error calculating 15-min volume: {e}")
+                bot.state.day_type = "NORMAL"
+
+
+        # ── 15:15 PM — Force exit all positions ──────────────────────────
+        force_exit_h, force_exit_m = Config.FORCE_EXIT_ALL_AT
+        if now.time() >= time(force_exit_h, force_exit_m):
+            if bot.tm.active_trades:
+                logger.info(f"[USER {user_id}] 3:15 PM — Force exiting {len(bot.tm.active_trades)} active trades.")
+                for trade in list(bot.tm.active_trades):
+                    symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+                    if symbol_key and not Config.PAPER_TRADING_MODE:
+                        counter_side = "SELL" if trade['side'].upper() == "BUY" else "BUY"
+                        bot.engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
+                    bot.tm.close_trade(trade, "EOD_FORCED_EXIT", execution_engine=bot.engine)
+                    alert_trade_exit(trade['symbol'], "EOD FORCED EXIT",
+                                     trade['entry_price'], trade['current_price'], trade['pnl'])
+
+        # ── 15:25 PM — WebSocket disconnect ──────────────────────────────
+        ws_h, ws_m = Config.WEBSOCKET_DISCONNECT_AT
+        if now.time() >= time(ws_h, ws_m) and not ws_disconnected:
+            market_feed.stop()
+            ws_disconnected = True
+            logger.info(f"[USER {user_id}] 3:25 PM — WebSocket feed disconnected.")
+
+        # ── 15:30 PM — Daily summary ─────────────────────────────────────
+        if now.time() >= time(15, 30) and not daily_summary_sent:
+            try:
+                generate_daily_summary(
+                    bot.engine,
+                    pipeline_stats={
+                        "stocks_scanned": len(layer2.active_watchlist),
+                        "layer3_signals": layer3.scan_count,
+                        "orb_signals": orb.signals_today,
+                        "claude_enters": layer5.enter_decisions_today,
+                        "claude_calls": layer5.api_calls_today,
+                    },
+                    user_id=user_id,
+                )
+                daily_summary_sent = True
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Daily summary failed: {e}")
+
+        # ── 15:35 PM — Reconciliation ────────────────────────────────────
+        if now.time() >= time(15, 35) and not reconciliation_done:
+            try:
+                run_reconciliation(bot.engine, user_id=user_id)
+                reconciliation_done = True
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Reconciliation failed: {e}")
+
+        # ── After 15:15 — no more scanning needed ────────────────────────
+        if now.time() >= time(force_exit_h, force_exit_m):
+            await asyncio.sleep(60)
+
+        # ── Layer 2: Watchlist Refresh (every 10 minutes, 9:20 AM – 3:00 PM) ──
+        now_ts_main = _time.time()
+        market_open = time(9, 20) <= now.time() < time(15, 0)
+        if market_open and (now_ts_main - last_layer2_refresh) >= 600:  # 600 seconds = 10 minutes
+            try:
+                layer2.refresh()
+                last_layer2_refresh = now_ts_main
+                alert_watchlist_refreshed(now.strftime("%H:%M"), len(layer2.active_watchlist))
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Layer 2 refresh failed: {e}")
+
+        # ── ORB Phase 2: Breakout scan (9:30 AM – 11:00 AM, every 60s) ───────
+        orb_now_ts = _time.time()
+        orb_window_active = time(9, 30) <= now.time() < time(11, 0)
+        if (orb_obs_complete and orb_window_active
+                and get_global_trading_enabled()
+                and (orb_now_ts - orb_last_scan) >= 60):
+            orb_last_scan = orb_now_ts
+            try:
+                nifty_chg_pct = layer4.get_nifty_change_pct()
+                nifty_trend = layer4.get_nifty_trend()
+                active_trade_symbols = [t['symbol'] for t in bot.tm.active_trades]
+                vix_ltp = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+                orb_signals = orb.scan(
+                    layer2.active_watchlist,
+                    _shared_prices,
+                    active_trade_symbols,
+                    bot.engine,
+                    nifty_change_pct=nifty_chg_pct
+                )
+                for orb_sig in orb_signals:
+                    # Market Regime Block for ORB
+                    if nifty_trend == "bearish" and orb_sig["direction"] == "LONG":
+                        logger.info(f"[USER {user_id}] ORB LONG blocked for {orb_sig['symbol']} — market regime is TRENDING_DOWN (bearish)")
+                        continue
+                    if nifty_trend == "bullish" and orb_sig["direction"] == "SHORT":
+                        logger.info(f"[USER {user_id}] ORB SHORT blocked for {orb_sig['symbol']} — market regime is TRENDING_UP (bullish)")
+                        continue
+                        
+                    _add_signal_log(
+                        f"[{now.strftime('%H:%M')}] ORB 🔔 {orb_sig['symbol']} "
+                        f"{orb_sig['direction']} — Vol={orb_sig['vol_ratio_6bar']:.1f}x | "
+                        f"H={orb_sig['orb_high']}/L={orb_sig['orb_low']} | R:R={orb_sig.get('rr_ratio',0):.1f}x"
+                    )
+                    # Build a minimal Layer 4 payload for Claude to evaluate the ORB setup
+                    now_ist = datetime.now(IST)
+                    signal_time = now_ist.strftime("%H:%M")
+                    tod_h = now_ist.hour
+                    if tod_h < 12:
+                        time_bucket = "MORNING"
+                    elif tod_h < 13 or (tod_h == 13 and now_ist.minute < 30):
+                        time_bucket = "MIDDAY"
+                    else:
+                        time_bucket = "AFTERNOON"
+
+                    orb_payload = {
+                        "symbol": orb_sig["symbol"],
+                        "signal_direction": orb_sig["direction"],
+                        "signal_time": signal_time,
+                        "time_bucket": time_bucket,
+                        "layer3_conditions_met": 5,
+                        "price_context": {
+                            "ltp": orb_sig["ltp"],
+                            "price_vs_vwap_pct": 0.0,
+                            "price_vs_ema20_daily_pct": 0.0,
+                            "price_vs_20day_high_pct": 0.0,
+                            "atr_14_5min": abs(orb_sig["orb_high"] - orb_sig["orb_low"]) / 3,
+                            "atr_pct": orb_sig.get("or_range_pct", 0) / 3,
+                        },
+                        "momentum": {"rsi_14_5min": 60.0, "rsi_14_daily": 55.0,
+                                     "ema20_5min_slope": "rising" if orb_sig["direction"] == "LONG" else "falling",
+                                     "candle_strength_last": 1.0, "price_slope_10bar": 0},
+                        "volume": {"vol_ratio_20day_daily": 1.0,
+                                   "vol_ratio_6bar_5min": orb_sig["vol_ratio_6bar"],
+                                   "volume_trend": "expanding"},
+                        "levels": {
+                            "support_20bar_5min": orb_sig["orb_low"],
+                            "resistance_20bar_5min": orb_sig["orb_high"],
+                            "distance_to_resistance_pct": abs(orb_sig["orb_high"] - orb_sig["ltp"]) / orb_sig["ltp"] * 100,
+                            "distance_to_support_pct": abs(orb_sig["ltp"] - orb_sig["orb_low"]) / orb_sig["ltp"] * 100,
+                        },
+                        "market_context": {
+                            "nifty_trend_today": layer4.get_nifty_trend(),
+                            "india_vix": vix_ltp,
+                            "sector": "Unknown",
+                            "sector_vs_nifty_today_pct": 0.0,
+                            "stock_vs_nifty_5day_pct": 0.0,
+                        },
+                        "recent_candles_5min": [],
+                        "orb_meta": {"orb_high": orb_sig["orb_high"], "orb_low": orb_sig["orb_low"],
+                                     "or_range_pct": orb_sig.get("or_range_pct", 0),
+                                     "entry_price": orb_sig["entry_price"],
+                                     "stop_loss": orb_sig["stop_loss"],
+                                     "target": orb_sig["target"],
+                                     "rr_ratio": orb_sig.get("rr_ratio", 0),
+                                     "strategy": "ORB"},
+                    }
+                    use_ai = bot.config.get("USE_GROQ_FILTER", True)
+                    if use_ai:
+                        orb_decisions = layer5.analyze(
+                            [orb_payload],
+                            nifty_trend=layer4.get_nifty_trend(),
+                            nifty_change_pct=nifty_chg_pct,
+                            vix_value=vix_ltp,
+                        )
+                    else:
+                        orb_decisions = [{
+                            "symbol": orb_sig["symbol"],
+                            "decision": "ENTER",
+                            "direction": orb_sig["direction"],
+                            "entry_price": orb_sig["entry_price"],
+                            "stop_loss": orb_sig["stop_loss"],
+                            "target": orb_sig["target"],
+                            "confidence": 4,
+                            "reasoning": f"ORB breakout H={orb_sig['orb_high']}/L={orb_sig['orb_low']} with {orb_sig['vol_ratio_6bar']:.1f}x volume.",
+                            "strategy": "ORB",
+                        }]
+                    for od in orb_decisions:
+                        od["strategy"] = "ORB"
+                        if od.get("decision") == "ENTER":
+                            await _execute_v2_trade(user_id, bot, od, [orb_sig])
+            except Exception as orb_err:
+                logger.error(f"[USER {user_id}] ORB breakout scan error: {orb_err}")
+
+        # ── Layer 3-5: Signal scanning (every 5 min, 9:20 AM – 2:30 PM) ──
+        now_ts_main = _time.time()
+        if now.time() >= time(9, 20) and (now_ts_main - last_l3_scan) >= 300:
+            last_l3_scan = now_ts_main
+            cutoff_h, cutoff_m = Config.NO_NEW_ENTRIES_AFTER
             
-            # Signal record metadata handling
-            if 'metadata' in signal_data and signal_data['metadata']:
-                # Individual stock conditions are now stored in signal metadata only
-                pass
-            
-            # 6. Risk Management & Execution
-            if final_decision in ['BUY', 'SELL']:
-                execute_trade(symbol_name, symbol_key, final_decision, signal_record)
+            # Layer 3 runs even after cutoff for awareness, but L4/L5 don't
+            vix_ltp = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+            active_trade_symbols = [t['symbol'] for t in bot.tm.active_trades]
 
-        latest_signals = new_signals
-        
-        # 7. Update active trades & check exit conditions continuously using full market pulse
-        trade_manager.update_prices(live_prices_cache, execution_engine)
-        
-        # Check Kill Switch
-        daily_pnl = trade_manager.get_daily_pnl()
-        daily_loss_pct = daily_pnl / state.active_capital if state.active_capital > 0 else 0
-        
-        state.daily_pnl = daily_pnl
-        state.trades_taken = trade_manager.get_trades_taken_today()
-        
-        if daily_loss_pct <= -abs(Config.MAX_DAILY_LOSS_PCT):
-            logger.critical(f"KILL SWITCH ACTIVATED! Daily Loss ({daily_loss_pct*100:.2f}%) hit threshold ({-abs(Config.MAX_DAILY_LOSS_PCT)*100:.2f}%). Executing Upstox exit_all_positions()")
-            state.kill_switch_active = True
-            state.is_running = False
-            
-            # Fire Upstox Exit API
-            execution_engine.exit_all_positions()
-            
-            # Update local state manager
-            for trade in list(trade_manager.active_trades):
-                trade_manager.close_trade(trade, "KILL SWITCH")
-                
-        # Calculate how long this cycle took to avoid drifting execution loops
-        end_time = datetime.now(IST)
-        execution_duration = (end_time - start_time).total_seconds()
-        sleep_time = max(1, 60 - execution_duration)
-        
-        # Wait until the next actual minute cycle
-        await asyncio.sleep(sleep_time)
+            # VIX threshold alerts check (Section 8)
+            if not hasattr(bot.state, 'vix_alert_state'):
+                bot.state.vix_alert_state = 'normal'
 
-def execute_trade(symbol_name: str, symbol_key: str, side: str, signal: dict):
-    # Instrument Token Validation
-    if symbol_name not in Config.SYMBOLS_MAPPING:
-        logger.error(f"Invalid symbol exception! {symbol_name} missing from mappings.")
+            if vix_ltp > 25.0:
+                if bot.state.vix_alert_state != 'halted':
+                    from telegram_alert import alert_vix_too_high
+                    alert_vix_too_high(vix_ltp)
+                    bot.state.vix_alert_state = 'halted'
+            elif vix_ltp > 18.0:
+                if bot.state.vix_alert_state != 'cautious':
+                    from telegram_alert import alert_vix_cautious
+                    alert_vix_cautious(vix_ltp)
+                    bot.state.vix_alert_state = 'cautious'
+            else:
+                bot.state.vix_alert_state = 'normal'
+
+            try:
+                # Pass latest sector performance from Layer 4 into Layer 3
+                sector_perf = layer4.get_sector_perf() if hasattr(layer4, 'get_sector_perf') else {}
+
+                signals = layer3.scan(
+                    layer2.active_watchlist,
+                    active_trade_symbols,
+                    _shared_prices,
+                    vix_value=vix_ltp,
+                    sector_perf=sector_perf,
+                    day_type=getattr(bot.state, "day_type", "NORMAL")
+                )
+                _pipeline_stats["layer3_signals"] += len(signals)
+
+                # Log signals for dashboard
+                for sig in signals:
+                    _add_signal_log(f"[{now.strftime('%H:%M')}] {sig['symbol']} {sig['direction']} — {sig['conditions_met']}/5 conditions met")
+
+                # Only proceed to Layer 4+5 before the entry cutoff
+                if signals and now.time() < time(cutoff_h, cutoff_m):
+                    # Check global halt for new entries
+                    if get_global_trading_enabled():
+                        # Layer 4: Feature extraction
+                        feature_payloads = layer4.extract(
+                            signals, _shared_prices, _shared_state.live_indices, 
+                            day_type=getattr(bot.state, "day_type", "NORMAL")
+                        )
+
+                        if feature_payloads:
+                            # Check if Generative Filter is enabled
+                            use_ai = bot.config.get("USE_GROQ_FILTER", True)
+
+                            if use_ai:
+                                # Layer 5: Claude analysis
+                                nifty_trend = layer4.get_nifty_trend()
+                                nifty_change = layer4.get_nifty_change_pct()
+                                vix_val = layer4.get_vix_value()
+
+                                decisions = layer5.analyze(
+                                    feature_payloads,
+                                    nifty_trend=nifty_trend,
+                                    nifty_change_pct=nifty_change,
+                                    vix_value=vix_val,
+                                )
+                                _pipeline_stats["claude_calls"] = layer5.api_calls_today
+                            else:
+                                logger.info(f"[USER {user_id}] Generative Filter disabled — running local rule analysis (bypassing Claude).")
+                                decisions = run_local_rule_analysis(feature_payloads)
+
+                            # Log decisions
+                            for d in decisions:
+                                color_label = "ENTER" if d.get("decision") == "ENTER" else "SKIP"
+                                source_label = "Claude" if use_ai else "Local"
+                                _add_signal_log(
+                                    f"[{now.strftime('%H:%M')}] {d['symbol']} → {color_label} "
+                                    f"({source_label} confidence: {d.get('confidence', 0)}/5) — {d.get('reasoning', '')[:80]}"
+                                )
+
+                            # Process ENTER decisions
+                            enter_decisions = layer5.get_enter_decisions(decisions)
+                            if use_ai:
+                                _pipeline_stats["claude_enters"] += len(enter_decisions)
+
+                            for decision in enter_decisions:
+                                await _execute_v2_trade(user_id, bot, decision, signals)
+                    else:
+                        logger.info(f"[USER {user_id}] Global halt active — skipping Layer 4/5.")
+
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Pipeline scan error: {e}")
+
+        # Update bot state
+        bot.state.daily_pnl    = bot.tm.get_daily_pnl()
+        bot.state.trades_taken = bot.tm.get_trades_taken_today()
+
+        daily_pnl = bot.tm.get_daily_pnl()
+        if daily_pnl <= -abs(Config.DAILY_LOSS_LIMIT):
+            logger.critical(f"[USER {user_id}] KILL SWITCH! Daily Loss ={daily_pnl:.2f}")
+            bot.state.kill_switch_active = True
+            bot.state.is_running = False
+            if not Config.PAPER_TRADING_MODE:
+                bot.engine.exit_all_positions()
+            for trade in list(bot.tm.active_trades):
+                bot.tm.close_trade(trade, "KILL SWITCH", execution_engine=bot.engine)
+
+        # Sleep 60 seconds — supports 1-min ORB checks during morning window.
+        # Main Layer 3-5 scan (every 5 min) is controlled by a separate timestamp tracker below.
+        await asyncio.sleep(60)
+
+
+def _add_signal_log(entry: str):
+    """Add an entry to the signal log (last 50)."""
+    global _signal_log
+    _signal_log.append({"time": datetime.now(IST).isoformat(), "message": entry})
+    if len(_signal_log) > 50:
+        _signal_log = _signal_log[-50:]
+
+
+async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: list):
+    """
+    Execute a trade based on Claude's ENTER decision (Section 4).
+    """
+    symbol = decision.get("symbol", "")
+    direction = decision.get("direction", "LONG")
+    entry_price = float(decision.get("entry_price", 0))
+    stop_loss = float(decision.get("stop_loss") or 0.0)
+    target = float(decision.get("target") or 0.0)
+    confidence = int(decision.get("confidence", 0))
+    reasoning = decision.get("reasoning", "")
+
+    # Map direction to side
+    side = "BUY" if direction == "LONG" else "SELL"
+    symbol_key = Config.SYMBOLS_MAPPING.get(symbol)
+    if not symbol_key:
+        logger.warning(f"[USER {user_id}] Unknown symbol {symbol} in ENTER decision. Skipping.")
         return
 
-    # Removed hardcoded max trades per day and max open trades restrictions.
-    # Duplicate Order Protection & Cooldown
-    for t in trade_manager.active_trades:
-        if t['symbol'] == symbol_name:
-            logger.info(f"Duplicate order blocked for {symbol_name}. Already holding.")
-            return
-
-    # ── OVERTRADING CONTROL (Phase 4) ────────────────────────────────────────
-    # 1. Global Cooldown (After 2 back-to-back losses)
-    if hasattr(state, 'loss_cooldown_until') and state.loss_cooldown_until:
-        if datetime.now(IST) < state.loss_cooldown_until:
-            logger.info("Global cooldown active due to 2 consecutive losses. Skipping trade.")
-            return
-
-    # 2. Same Stock Re-entry Block (15 mins)
-    now = datetime.now(IST)
-    last_trade = state.last_trade_time.get(symbol_name)
-    if last_trade and (now - last_trade).total_seconds() < 900:  # 15 minutes
-        logger.info(f"Cooldown active for {symbol_name}. Skipping trade. (< 15 mins)")
-        return
-    
-    # ── POSITION SIZING WITH HARD CAP ────────────────────────────────────────
-    risk_per_trade = state.active_capital * Config.RISK_PER_TRADE_PCT
-    entry = signal['entry_price']
-    sl = signal['sl']
-
-    sl_distance = abs(entry - sl)
-    if sl_distance <= 0:
-        logger.error(f"Invalid SL Distance for {symbol_name}. Skipping.")
+    # Step 1 — Freshness check
+    if not market_feed.is_tick_fresh(symbol, max_age=30.0):
+        logger.warning(f"[USER {user_id}] Stale feed for {symbol} — skipping trade.")
         return
 
-    qty = int(risk_per_trade / sl_distance)
-
-    # HARD CAP: Never let position value exceed 20% of capital
-    MAX_POSITION_VALUE = state.active_capital * 0.20
-    max_qty_by_value = int(MAX_POSITION_VALUE / entry) if entry > 0 else 0
-    qty = min(qty, max_qty_by_value)
-
-    if qty <= 0:
-        logger.error(f"Qty=0 after position cap for {symbol_name} (entry=₹{entry:.2f}). Skipping.")
+    # Step 2 — Price proximity check (Momentum: 0.3%, ORB: 0.5%)
+    ltp = _shared_prices.get(symbol, 0)
+    if ltp <= 0:
+        return
+    slippage_pct = abs(ltp - entry_price) / entry_price * 100
+    strat_type = decision.get("strategy", "MOMENTUM")
+    max_slippage = Config.MAX_ORB_SLIPPAGE_PCT if strat_type == "ORB" else Config.MAX_MOMENTUM_SLIPPAGE_PCT
+    if slippage_pct > max_slippage:
+        logger.warning(f"[USER {user_id}] Price moved too far for {symbol} ({strat_type}): "
+                       f"LTP={ltp}, entry={entry_price}, slippage={slippage_pct:.2f}% (max {max_slippage}%). Skipping.")
         return
 
-    logger.info(f"Position sizing: {symbol_name} qty={qty}, entry=₹{entry:.2f}, value=₹{qty*entry:.0f}, SL=₹{sl:.2f}, risk=₹{qty*sl_distance:.0f}")
-    
-    # Execute Upstox API Call
-    res = execution_engine.place_order_with_retry(symbol_key, side, qty)
-    
-    # Order Confirmation Check & API Failure Guard
-    if res.get('status') != 'success':
-        logger.error(f"Trade execution rejected or failed for {symbol_name}. Aborting.")
+    # Step 3 — Daily limit check
+    max_trades = bot.config.get('MAX_TRADES_PER_DAY', Config.MAX_TRADES_PER_DAY)
+    trades_today = get_trades_count_today(user_id)
+    if trades_today >= max_trades:
+        logger.warning(f"[USER {user_id}] Daily trade limit reached ({trades_today}/{max_trades}). Skipping.")
+        alert_daily_limit_reached(user_id, max_trades)
         return
-        
-    # Immediate Stop Loss Processing
-    sl_res = execution_engine.place_stop_loss(symbol_key, side, qty, sl)
-    
-    if sl_res.get('status') != 'success':
-        logger.critical(f"SL FAILED for {symbol_name}! Executing naked position immediate exit.")
-        # Reverse trade to squash naked position
-        counter_side = "SELL" if side == "BUY" else "BUY"
-        execution_engine.place_order_with_retry(symbol_key, counter_side, qty)
+
+    # Step 3.5 — Concurrent open trades check (Dynamic per user config)
+    max_open = bot.config.get('MAX_OPEN_TRADES', Config.MAX_OPEN_TRADES)
+    active_trades_count = len(bot.tm.active_trades)
+    if active_trades_count >= max_open:
+        logger.warning(f"[USER {user_id}] Max open trades limit reached ({active_trades_count}/{max_open}). Skipping trade for {symbol}.")
         return
-        
-    # Both Main order and SL order executed successfully
-    trade_manager.add_trade(
-        symbol=symbol_name,
-        side=side,
-        entry_price=entry,
-        qty=qty,
-        sl=sl,
-        target=signal['target'],
-        probability=0.0, # Removed raw param for UI
-        score=signal['score'],
-        sl_order_id=sl_res.get('order_id'),
-        metadata=signal.get('metadata')
+
+    # Step 4 — Quantity calculation
+    # Divide capital by MAX_OPEN_TRADES (concurrent positions), not MAX_TRADES_PER_DAY
+    per_trade_capital = bot.state.active_capital / max_open
+    # Apply 5x intraday leverage — Upstox grants up to 5x for product="I" (intraday)
+    INTRADAY_LEVERAGE = 5
+    effective_capital = per_trade_capital * INTRADAY_LEVERAGE
+    quantity = math.floor(effective_capital / entry_price)
+    logger.info(
+        f"[USER {user_id}] Qty calc: capital={bot.state.active_capital:.0f}, "
+        f"max_open={max_open}, per_trade=Rs{per_trade_capital:.0f}, "
+        f"leverage={INTRADAY_LEVERAGE}x, effective=Rs{effective_capital:.0f}, "
+        f"price={entry_price:.2f} -> qty={quantity} for {symbol}"
     )
-    trade_manager.active_trades[-1]['instrument_token'] = symbol_key
-    state.last_trade_time[symbol_name] = datetime.now(IST)
+    if quantity <= 0:
+        logger.warning(f"[USER {user_id}] Quantity rounds to 0 for {symbol}. Skipping.")
+        return
 
-@app.get("/")
-def get_dashboard():
-    with open("frontend/index.html", "r", encoding="utf-8") as f:
-        html_content = f.read()
-    return HTMLResponse(content=html_content)
+    # Step 4.5 — IMPROVEMENT 4: VIX-based position sizing
+    # Scale down position size as volatility rises to protect capital automatically.
+    vix_now = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
+    if vix_now >= 25.0:
+        logger.warning(f"[USER {user_id}] VIX={vix_now:.1f} >= 25 — blocking trade for {symbol}.")
+        return
+    elif vix_now >= 20.0:
+        vix_multiplier = 0.4
+    elif vix_now >= 16.0:
+        vix_multiplier = 0.6
+    elif vix_now >= 13.0:
+        vix_multiplier = 0.8
+    else:
+        vix_multiplier = 1.0
 
-@app.get("/api/signals")
-def api_get_signals():
-    return latest_signals
+    if vix_multiplier < 1.0:
+        adjusted_qty = math.floor(quantity * vix_multiplier)
+        if adjusted_qty <= 0:
+            logger.warning(f"[USER {user_id}] VIX={vix_now:.1f} reduced qty to 0 for {symbol}. Skipping.")
+            return
+        logger.info(f"[USER {user_id}] VIX={vix_now:.1f} → position sized to {vix_multiplier:.0%} "
+                    f"({quantity} → {adjusted_qty} shares) for {symbol}.")
+        quantity = adjusted_qty
 
-@app.get("/api/live-prices")
-def api_get_live_prices():
-    return live_prices_cache
+    # Log order value — Upstox handles margin/leverage validation, we do NOT block here.
+    # Upstox will reject if margin is truly insufficient; we must always attempt placement.
+    order_value = quantity * entry_price
+    logger.info(
+        f"[USER {user_id}] Order value for {symbol}: Rs{order_value:.2f} "
+        f"(leveraged intraday). Sending to Upstox for margin validation."
+    )
 
-@app.get("/api/trades/active")
-def api_get_active_trades():
-    return trade_manager.active_trades
+    # Find layer3 signal for this symbol (for conditions_met)
+    l3_signal = next((s for s in layer3_signals if s["symbol"] == symbol), {})
+    conditions_met = l3_signal.get("conditions_met", 0)
 
-@app.get("/api/trades/history")
-def api_get_trade_history():
-    return sorted(trade_manager.trade_history, key=lambda x: x['timestamp'], reverse=True)
-
-@app.get("/api/trades/all-history")
-def api_get_all_history(start_date: str = None, end_date: str = None):
+    # Step 5 — Place entry order (or simulate in paper mode)
+    is_paper = Config.PAPER_TRADING_MODE or (bot.engine.mode == 'TEST')
+    if is_paper:
+        logger.info(f"[USER {user_id}] PAPER TRADE WOULD ENTER: {direction} {symbol} @ ₹{ltp:.2f}")
+        order_id = f"paper_{symbol}_{side}"
+        filled_qty = quantity
+        actual_entry = ltp
+    else:
+        res = bot.engine.place_order_with_retry(symbol_key, side, quantity)
+        
+        if res.get('status') == 'unknown':
+            # Bug Fix 1: Order status unknown
+            alert_order_status_unknown(symbol, res.get('order_id', 'N/A'))
+            add_to_daily_blacklist(user_id, symbol)
+            return
+        
+        if res.get('status') != 'success':
+            send_alert(user_id, f"Entry order placement failed for {symbol} ({side}).")
+            return
+ 
+        order_id = res.get('order_id')
+        filled_qty = res.get('filled_quantity', quantity)
+        actual_entry = res.get('average_price', entry_price) or entry_price
+ 
+        # Bug Fix 2: Check filled quantity
+        if filled_qty <= 0:
+            logger.error(f"[USER {user_id}] Filled quantity is 0 for {symbol}. Aborting SL placement.")
+            send_alert(user_id, f"Entry order filled quantity is 0 for {symbol}. No SL placed.")
+            return
+ 
+    # Step 6 — Place SL order
+    sl_order_id = None
+    if not is_paper:
+        sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
+        if sl_res.get('status') != 'success':
+            send_alert(user_id, f"SL order placement failed for {symbol}. Emergency square-off!")
+            counter_side = "SELL" if side == "BUY" else "BUY"
+            exit_res = bot.engine.place_order_with_retry(symbol_key, counter_side, filled_qty)
+            if exit_res.get('status') != 'success':
+                send_alert(user_id, f"FATAL: Emergency square-off failed for {symbol}! Manual intervention required!")
+            return
+        sl_order_id = sl_res.get('order_id')
+ 
+    # Step 7 — Persist to database
+    bot.tm.add_trade(
+        symbol=symbol, side=side,
+        entry_price=actual_entry if not is_paper else ltp,
+        qty=filled_qty,
+        sl=stop_loss, target=target,
+        probability=0.0, score=confidence,
+        sl_order_id=sl_order_id,
+        metadata={
+            'confidence': confidence,
+            'reasoning': reasoning,
+            'layer3_conditions_met': conditions_met,
+            'paper_trade': is_paper,
+            'atr_14': l3_signal.get('atr_14', 0),
+            'market_condition': 'TRENDING',
+        }
+    )
+    bot.tm.active_trades[-1]['instrument_token'] = symbol_key
+ 
+    # Update trade record with v2 + analytics columns
     db = SessionLocal()
     try:
-        query = db.query(Trade)
-        
-        if start_date:
-            query = query.filter(Trade.trade_date >= start_date)
-        if end_date:
-            query = query.filter(Trade.trade_date <= end_date)
-            
-        trades = query.order_by(desc(Trade.entry_time)).all()
-        
-        result = []
-        for t in trades:
-            result.append({
-                'id': t.id,
-                'date': t.trade_date.isoformat() if t.trade_date else None,
-                'entry_time': t.entry_time.isoformat() if t.entry_time else None,
-                'exit_time': t.exit_time.isoformat() if t.exit_time else None,
-                'symbol': t.symbol,
-                'side': t.side,
-                'qty': t.quantity or 1,
-                'entry_price': t.entry_price,
-                'exit_price': t.exit_price,
-                'sl': t.sl_price,
-                'pnl': t.realized_pnl or 0.0,
-                'exit_reason': t.exit_reason,
-                'status': t.status if t.status == 'OPEN' else ('Win' if (t.realized_pnl or 0) > 0 else 'Loss' if (t.realized_pnl or 0) < 0 else 'Breakeven')
-            })
-        return result
+        db_trade = db.query(Trade).filter(Trade.id == bot.tm.active_trades[-1]['id']).first()
+        if db_trade:
+            db_trade.confidence           = confidence
+            db_trade.reasoning            = reasoning[:500] if reasoning else None
+            db_trade.layer3_conditions_met = conditions_met
+            db_trade.paper_trade          = is_paper
+
+            # ── Strategy analytics columns ─────────────────────────────────
+            now_ist       = get_ist_now()
+            tod_h         = now_ist.hour
+            if tod_h < 12:
+                tod_bucket = "MORNING"
+            elif tod_h < 13 or (tod_h == 13 and now_ist.minute < 30):
+                tod_bucket = "MIDDAY"
+            else:
+                tod_bucket = "AFTERNOON"
+
+            strategy_tag = decision.get("strategy", "MOMENTUM")
+
+            risk_val   = abs(entry_price - stop_loss) if stop_loss else 0
+            reward_val = abs(target - entry_price) if target else 0
+            rr         = round(reward_val / risk_val, 2) if risk_val > 0 else None
+
+            db_trade.strategy_type      = strategy_tag
+            db_trade.rr_ratio           = rr
+            db_trade.timeframe_aligned  = l3_signal.get("timeframe_aligned", None)
+            db_trade.sector_aligned     = l3_signal.get("sector_aligned", None)
+            db_trade.vix_at_entry       = round(vix_now, 1) if vix_now else None
+            db_trade.time_of_day_bucket = tod_bucket
+
+            # ── Check if Python rules would have entered without Claude ──
+            would_enter_no_claude = False
+            try:
+                if strategy_tag == "ORB":
+                    # ORB signals are already fully validated by Python rules before reaching this step
+                    would_enter_no_claude = True
+                else:
+                    from pipeline_layer4 import FeatureExtractor
+                    fe = FeatureExtractor(bot.engine)
+                    # Reconstruct the feature payload for the signal
+                    payloads = fe.extract([l3_signal], _shared_prices, _shared_state.live_indices)
+                    if payloads:
+                        local_decisions = run_local_rule_analysis(payloads)
+                        if local_decisions and local_decisions[0].get("decision") == "ENTER":
+                            would_enter_no_claude = True
+            except Exception as ex:
+                logger.error(f"Error computing would_have_entered_without_claude: {ex}")
+
+            db_trade.would_have_entered_without_claude = would_enter_no_claude
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating v2 trade columns: {e}")
     finally:
         db.close()
 
-@app.get("/api/status")
-def api_get_status():
+ 
+    # Step 8 — Add to daily blacklist
+    add_to_daily_blacklist(user_id, symbol)
+ 
+    # Step 9 — Send Telegram alert
+    alert_trade_entry(
+        direction, symbol,
+        actual_entry if not is_paper else ltp,
+        stop_loss, target, filled_qty, confidence, reasoning
+    )
+ 
+    logger.info(f"[USER {user_id}] {'PAPER ' if is_paper else ''}Trade placed: "
+                f"{direction} {symbol} x{filled_qty} @ ₹{actual_entry if not is_paper else ltp:.2f}")
+
+
+# -- Per-user running tasks map: user_id -> asyncio.Task ----------------------
+_user_tasks: Dict[int, asyncio.Task] = {}
+
+
+async def ensure_user_bot_task(user_id: int, db):
+    """Ensure a trading cycle task is running for the given user."""
+    if user_id not in _user_tasks or _user_tasks[user_id].done():
+        get_or_create_bot(user_id, db)
+        _user_tasks[user_id] = asyncio.create_task(user_trading_cycle(user_id))
+        logger.info(f"[USER {user_id}] Trading task started.")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# AUTH ROUTES
+# ────────────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    remember: bool = False
+
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
+
+class CredentialUpdateRequest(BaseModel):
+    upstox_client_id:     Optional[str] = None
+    upstox_client_secret: Optional[str] = None
+    upstox_access_token:  Optional[str] = None
+    analytics_token:      Optional[str] = None
+
+@app.get("/login")
+def get_login_page():
+    with open("frontend/login.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/register")
+def get_register_page():
+    with open("frontend/register.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/credentials")
+def get_credentials_page():
+    with open("frontend/credentials.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.post("/auth/register")
+async def register(body: RegisterRequest, db=Depends(get_db)):
+    """Create a new user account."""
+    import re
+    email = body.email.strip().lower()[:254]
+    username = re.sub(r'[^a-zA-Z0-9_.-]', '', body.username.strip())[:80]
+    password = body.password
+
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if not re.match(r'^[^@]+@[^@]+\.[^@]+$', email):
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid username.")
+
+    try:
+        user = create_user(db, email=email, username=username, password=password)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    access_token   = create_access_token(user.id, user.email, user.role)
+    refresh_token  = create_refresh_token(user.id, user.email)
+    exp_seconds    = ACCESS_TOKEN_EXP * 60
+
+    response = JSONResponse({
+        "access_token": access_token,
+        "token_type":   "bearer",
+        "expires_in":   exp_seconds,
+        "username":     user.username,
+        "email":        user.email,
+        "role":         user.role,
+    })
+    _set_auth_cookies(response, access_token, refresh_token)
+    return response
+
+@app.post("/auth/login")
+async def post_login(request: Request, body: LoginRequest, db=Depends(get_db)):
+    """Authenticate user, return JWT tokens."""
+    client_ip = request.client.host
+    limited, retry_after = is_rate_limited(client_ip)
+    if limited:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many login attempts.", "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    username = body.username.strip()[:120]
+    password = body.password[:128]
+
+    user = authenticate_user(db, username, password)
+    if not user:
+        record_login_attempt(client_ip)
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    clear_login_attempts(client_ip)
+    access_token  = create_access_token(user.id, user.email, user.role)
+    refresh_token = create_refresh_token(user.id, user.email)
+    exp_seconds   = ACCESS_TOKEN_EXP * 60
+
+    # Ensure the user's bot task is running
+    await ensure_user_bot_task(user.id, db)
+
+    from database import log_system_event
+    log_system_event(db, user.id, "INFO", "LOGIN", f"User {user.username} logged in from {client_ip}")
+
+    response = JSONResponse({
+        "access_token": access_token,
+        "token_type":   "bearer",
+        "expires_in":   exp_seconds,
+        "username":     user.username,
+        "email":        user.email,
+        "role":         user.role,
+    })
+    _set_auth_cookies(response, access_token, refresh_token)
+    return response
+
+# Keep old /login POST for backwards compat
+@app.post("/login")
+async def post_login_legacy(request: Request, body: LoginRequest, db=Depends(get_db)):
+    return await post_login(request, body, db)
+
+def _set_auth_cookies(response: JSONResponse, access_token: str, refresh_token: str):
+    is_https = os.getenv("HTTPS", "false").lower() == "true"
+    opts = dict(httponly=True, samesite="lax", secure=is_https)
+    response.set_cookie("access_token",  access_token,  max_age=ACCESS_TOKEN_EXP * 60,     **opts)
+    response.set_cookie("refresh_token", refresh_token, max_age=REFRESH_TOKEN_EXP * 86400, **opts)
+
+@app.post("/logout")
+async def logout(request: Request, token: str = Depends(get_token_from_request)):
+    if token:
+        revoke_access_token(token)
+    refresh = request.cookies.get("refresh_token")
+    if refresh:
+        revoke_refresh_token(refresh)
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie("access_token")
+    response.delete_cookie("refresh_token")
+    return response
+
+@app.post("/refresh")
+async def refresh_token_endpoint(request: Request, db=Depends(get_db)):
+    refresh = request.cookies.get("refresh_token")
+    if not refresh:
+        raise HTTPException(status_code=401, detail="No refresh token.")
+    payload = verify_refresh_token(refresh)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token.")
+
+    user_id = payload.get("uid")
+    user = get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+
+    new_access  = create_access_token(user.id, user.email, user.role)
+    new_refresh = create_refresh_token(user.id, user.email)
+    revoke_refresh_token(refresh)
+
+    response = JSONResponse({"access_token": new_access, "token_type": "bearer"})
+    _set_auth_cookies(response, new_access, new_refresh)
+    return response
+
+@app.get("/me")
+async def get_me(user: dict = Depends(require_auth), db=Depends(get_db)):
+    db_user = get_user_by_id(db, user["uid"])
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    from credential_service import credential_field_status
+    cred_status = credential_field_status(db, db_user.id)
     return {
-        "is_running": state.is_running,
-        "kill_switch_active": state.kill_switch_active,
-        "daily_pnl": state.daily_pnl,
-        "trades_taken": state.trades_taken,
-        "max_trades": Config.MAX_TRADES_PER_DAY,
-        "market_condition": state.market_condition,
-        "indices": state.live_indices,
-        "indices_prev_close": state.index_prev_close,
-        "ws_live": market_feed.is_live(),
-        "active_capital": state.active_capital
+        "username":    db_user.username,
+        "email":       db_user.email,
+        "role":        db_user.role,
+        "credentials": cred_status,
     }
 
-@app.post("/api/toggle")
-def api_toggle_bot():
-    state.is_running = not state.is_running
-    return {"status": "success", "is_running": state.is_running}
+# ────────────────────────────────────────────────────────────────────────────
+# CREDENTIALS
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/config")
-def api_get_config():
-    # Only return variables, exclude mappings and tokens for security and display
-    return {k: getattr(Config, k) for k in dir(Config) if not k.startswith("__") and not callable(getattr(Config, k)) and k not in ['SYMBOLS_MAPPING', 'UPSTOX_ACCESS_TOKEN', 'UPSTOX_CLIENT_ID', 'UPSTOX_CLIENT_SECRET', 'GROQ_API_KEY', 'REDIRECT_URI']}
+@app.post("/credentials")
+async def upsert_user_credentials(
+    body: CredentialUpdateRequest,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    """
+    Write-only credential endpoint.
+    - Accepts partial updates (blank fields are ignored)
+    - Values are AES-256 encrypted before DB storage
+    - NEVER returns stored values in any response
+    """
+    user_id = user["uid"]
+    try:
+        upsert_credentials(
+            db, user_id,
+            upstox_client_id=body.upstox_client_id,
+            upstox_client_secret=body.upstox_client_secret,
+            upstox_access_token=body.upstox_access_token,
+            analytics_token=body.analytics_token,
+        )
+        # Reload the engine with new credentials (hot-reload)
+        reload_bot_credentials(user_id, db)
 
-@app.post("/api/config")
-async def api_post_config(request: Request):
-    data = await request.json()
-    for k, v in data.items():
-        if hasattr(Config, k):
-            # For secure token handling: only update if not empty, since UI won't show it back
-            if k == 'UPSTOX_ACCESS_TOKEN' and (not v or v.strip() == ""):
-                continue
-            setattr(Config, k, v)
-    Config.save()
+        # ALSO update the shared components (shared engine & market feed WebSocket)
+        from credential_service import get_decrypted_credentials
+        fresh_creds = get_decrypted_credentials(db, user_id)
+        if fresh_creds.get("upstox_access_token"):
+            logger.info(f"Hot-reloading shared engine and market feed with updated credentials from user {user_id}")
+            _shared_engine._creds = fresh_creds
+            
+            # Restart market feed with new credentials
+            market_feed.stop()
+            # Wait a brief moment for it to stop cleanly
+            await asyncio.sleep(1)
+            market_feed.start(
+                _shared_prices, 
+                _shared_state.live_indices, 
+                _shared_state.index_prev_close, 
+                None, 
+                _shared_timestamps,
+                credentials=fresh_creds
+            )
+
+        from database import log_system_event
+        log_system_event(db, user_id, "INFO", "CRED_UPDATE", "User updated trading credentials")
+
+        return {
+            "status":  "saved",
+            "message": "Credentials saved securely. Fields updated: " + ", ".join(
+                f for f, v in {
+                    "client_id":     body.upstox_client_id,
+                    "client_secret": body.upstox_client_secret,
+                    "access_token":  body.upstox_access_token,
+                    "analytics":     body.analytics_token,
+                }.items() if v and v.strip()
+            ) or "none",
+            "credentials": credential_field_status(db, user_id),
+        }
+    except Exception as e:
+        logger.error(f"Credential save failed for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save credentials.")
+
+@app.get("/credentials/status")
+async def get_credential_status(
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    """Returns which fields are set (True/False only). NEVER returns values."""
+    return credential_field_status(db, user["uid"])
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# DASHBOARD ROUTES (auth-protected)
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def get_dashboard(request: Request, token: Optional[str] = Depends(get_token_from_request)):
+    if not token or not verify_access_token(token):
+        return RedirectResponse("/login", status_code=302)
+    with open("frontend/index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/dual")
+def get_dual(request: Request, token: Optional[str] = Depends(get_token_from_request)):
+    if not token or not verify_access_token(token):
+        return RedirectResponse("/login", status_code=302)
+    with open("frontend/dual.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/dual-demo")
+def get_dual_demo(request: Request, token: Optional[str] = Depends(get_token_from_request)):
+    if not token or not verify_access_token(token):
+        return RedirectResponse("/login", status_code=302)
+    with open("frontend/dual_demo.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+# ────────────────────────────────────────────────────────────────────────────
+# API ROUTES (per-user isolated)
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/signals")
+def api_get_signals(user: dict = Depends(require_auth)):
+    return latest_signals
+
+@app.get("/api/live-prices")
+def api_get_live_prices(user: dict = Depends(require_auth)):
+    return _shared_prices
+
+@app.get("/api/trades/active")
+def api_get_active_trades(user: dict = Depends(require_auth)):
+    uid = user["uid"]
+    bot = get_bot(uid)
+    return bot.tm.active_trades if bot else []
+
+@app.get("/api/trades/history")
+def api_get_trade_history(user: dict = Depends(require_auth)):
+    uid = user["uid"]
+    bot = get_bot(uid)
+    if not bot:
+        return []
+    return sorted(bot.tm.trade_history, key=lambda x: x['timestamp'], reverse=True)
+
+@app.get("/api/trades/all-history")
+def api_get_all_history(
+    start_date: str = None,
+    end_date: str = None,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    uid = user["uid"]
+    query = db.query(Trade).filter(Trade.user_id == uid)
+    if start_date:
+        query = query.filter(Trade.trade_date >= start_date)
+    if end_date:
+        query = query.filter(Trade.trade_date <= end_date)
+    trades = query.order_by(desc(Trade.entry_time)).all()
+    result = []
+    for t in trades:
+        result.append({
+            'id': t.id, 'date': t.trade_date.isoformat() if t.trade_date else None,
+            'entry_time': t.entry_time.isoformat() if t.entry_time else None,
+            'exit_time':  t.exit_time.isoformat()  if t.exit_time  else None,
+            'symbol': t.symbol, 'side': t.side, 'qty': t.quantity or 1,
+            'entry_price': t.entry_price, 'exit_price': t.exit_price,
+            'sl': t.sl_price, 'pnl': t.realized_pnl or 0.0,
+            'exit_reason': t.exit_reason,
+            'status': t.status if t.status == 'OPEN' else (
+                'Win' if (t.realized_pnl or 0) > 0 else 'Loss' if (t.realized_pnl or 0) < 0 else 'Breakeven'
+            )
+        })
+    return result
+
+@app.get("/api/trades/strategy-performance")
+def api_get_strategy_performance(user: dict = Depends(require_auth), db=Depends(get_db)):
+    uid = user["uid"]
+    # Get all closed trades
+    trades = db.query(Trade).filter(Trade.user_id == uid, Trade.status != 'OPEN').all()
     
-    # Reload execution engine headers if token changed
-    if 'UPSTOX_ACCESS_TOKEN' in data and data['UPSTOX_ACCESS_TOKEN'].strip() != "":
-        execution_engine.headers['Authorization'] = f'Bearer {Config.UPSTOX_ACCESS_TOKEN}'
+    # helper lists
+    momentum_trades = []
+    orb_trades = []
+    
+    time_buckets = {"MORNING": [], "MIDDAY": [], "AFTERNOON": []}
+    vix_buckets = {"lt_13": [], "13_16": [], "16_20": []}
+    
+    for t in trades:
+        strat = (t.strategy_type or "MOMENTUM").upper()
+        pnl = t.realized_pnl or 0.0
+        is_win = pnl > 0
         
-    return {"status": "success", "message": "Configuration updated successfully!"}
+        # Strategy grouping
+        if strat == "ORB":
+            orb_trades.append(t)
+        else:
+            momentum_trades.append(t)
+            
+        # Time bucket grouping
+        tb = (t.time_of_day_bucket or "").upper()
+        if tb in time_buckets:
+            time_buckets[tb].append(is_win)
+        else:
+            if t.entry_time:
+                tod_h = t.entry_time.hour
+                if tod_h < 12:
+                    tb_fallback = "MORNING"
+                elif tod_h < 13 or (tod_h == 13 and t.entry_time.minute < 30):
+                    tb_fallback = "MIDDAY"
+                else:
+                    tb_fallback = "AFTERNOON"
+                time_buckets[tb_fallback].append(is_win)
+                
+        # VIX bucket grouping
+        vix = t.vix_at_entry
+        if vix is not None:
+            if vix < 13.0:
+                vix_buckets["lt_13"].append(is_win)
+            elif vix < 16.0:
+                vix_buckets["13_16"].append(is_win)
+            elif vix <= 20.0:
+                vix_buckets["16_20"].append(is_win)
+
+    def calc_stats(trade_list):
+        total = len(trade_list)
+        if total == 0:
+            return {"win_rate": 0, "avg_rr": 0.0, "trades": 0}
+        wins = sum(1 for t in trade_list if (t.realized_pnl or 0.0) > 0)
+        win_rate = round((wins / total) * 100, 1)
+        rr_vals = [t.rr_ratio for t in trade_list if t.rr_ratio is not None and t.rr_ratio > 0]
+        avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
+        return {"win_rate": win_rate, "avg_rr": avg_rr, "trades": total}
+
+    def calc_bucket_winrate(bool_list):
+        total = len(bool_list)
+        if total == 0:
+            return {"win_rate": 0, "trades": 0}
+        wins = sum(1 for is_win in bool_list if is_win)
+        return {"win_rate": round((wins / total) * 100, 1), "trades": total}
+
+    return {
+        "momentum": calc_stats(momentum_trades),
+        "orb": calc_stats(orb_trades),
+        "time_buckets": {k: calc_bucket_winrate(v) for k, v in time_buckets.items()},
+        "vix_buckets": {k: calc_bucket_winrate(v) for k, v in vix_buckets.items()}
+    }
+
+@app.get("/api/performance/report")
+def api_get_performance_report(user: dict = Depends(require_auth), db=Depends(get_db)):
+    uid = user["uid"]
+    
+    # Get all closed trades
+    trades = db.query(Trade).filter(Trade.user_id == uid, Trade.status != 'OPEN').all()
+    
+    total_trades = len(trades)
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "win_rate": 0,
+            "avg_win": 0,
+            "avg_loss": 0,
+            "expectancy": 0,
+            "best_time_bucket": "N/A",
+            "best_strategy": "N/A",
+            "claude_stats": {
+                "claude_approved_count": 0,
+                "claude_win_rate": 0,
+                "no_claude_count": 0,
+                "no_claude_win_rate": 0
+            }
+        }
+        
+    wins = [t.realized_pnl for t in trades if t.realized_pnl > 0]
+    losses = [t.realized_pnl for t in trades if t.realized_pnl < 0]
+    
+    win_rate = round((len(wins) / total_trades) * 100, 1)
+    avg_win = round(sum(wins) / len(wins), 2) if wins else 0.0
+    avg_loss = round(sum(losses) / len(losses), 2) if losses else 0.0
+    expectancy = round(sum(t.realized_pnl for t in trades) / total_trades, 2)
+    
+    # Group by strategy
+    strat_perf = {}
+    for t in trades:
+        strat = (t.strategy_type or "MOMENTUM").upper()
+        if strat not in strat_perf:
+            strat_perf[strat] = []
+        strat_perf[strat].append(t.realized_pnl > 0)
+        
+    best_strategy = "N/A"
+    best_strat_wr = -1.0
+    for strat, results in strat_perf.items():
+        wr = sum(1 for r in results if r) / len(results)
+        if wr > best_strat_wr:
+            best_strat_wr = wr
+            best_strategy = f"{strat} ({round(wr * 100)}% WR)"
+            
+    # Group by time bucket
+    time_perf = {}
+    for t in trades:
+        tb = (t.time_of_day_bucket or "").upper()
+        if not tb:
+            if t.entry_time:
+                tod_h = t.entry_time.hour
+                if tod_h < 12:
+                    tb = "MORNING"
+                elif tod_h < 13 or (tod_h == 13 and t.entry_time.minute < 30):
+                    tb = "MIDDAY"
+                else:
+                    tb = "AFTERNOON"
+        if tb:
+            if tb not in time_perf:
+                time_perf[tb] = []
+            time_perf[tb].append(t.realized_pnl > 0)
+            
+    best_time_bucket = "N/A"
+    best_time_wr = -1.0
+    for tb, results in time_perf.items():
+        wr = sum(1 for r in results if r) / len(results)
+        if wr > best_time_wr:
+            best_time_wr = wr
+            best_time_bucket = f"{tb} ({round(wr * 100)}% WR)"
+            
+    # Claude comparison stats
+    claude_approved = trades  # in our setup all executed trades went through Claude (or local rules acting as Claude)
+    claude_wins = sum(1 for t in claude_approved if t.realized_pnl > 0)
+    claude_win_rate = round((claude_wins / len(claude_approved)) * 100, 1) if claude_approved else 0.0
+    
+    # trades that would have entered without Claude (rules only)
+    no_claude = [t for t in trades if t.would_have_entered_without_claude]
+    no_claude_wins = sum(1 for t in no_claude if t.realized_pnl > 0)
+    no_claude_win_rate = round((no_claude_wins / len(no_claude)) * 100, 1) if no_claude else 0.0
+    
+    return {
+        "total_trades": total_trades,
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "best_time_bucket": best_time_bucket,
+        "best_strategy": best_strategy,
+        "claude_stats": {
+            "claude_approved_count": len(claude_approved),
+            "claude_win_rate": claude_win_rate,
+            "no_claude_count": len(no_claude),
+            "no_claude_win_rate": no_claude_win_rate
+        }
+    }
+
+@app.get("/api/status")
+def api_get_status(user: dict = Depends(require_auth)):
+    uid = user["uid"]
+    bot = get_bot(uid)
+    global_halt = not get_global_trading_enabled()
+    if not bot:
+        return {
+            "is_running": False, "kill_switch_active": False,
+            "daily_pnl": 0.0, "trades_taken": 0, "max_trades": Config.MAX_TRADES_PER_DAY,
+            "market_condition": "WAITING", "active_capital": 0.0,
+            "account_balance": 0.0, "usable_balance": 0.0,
+            "indices": _shared_state.live_indices,
+            "indices_prev_close": _shared_state.index_prev_close,
+            "active_trades": [], "mode": "TEST",
+            "credentials_set": False,
+            "ws_live": False,
+            "global_halt": global_halt,
+            "paper_trading": Config.PAPER_TRADING_MODE,
+        }
+
+    # Fetch live account balance and cache it for 60 seconds to avoid rate limiting
+    import time
+    now = time.time()
+    last_update = getattr(bot.state, 'last_balance_update', 0.0)
+    if now - last_update > 60.0 or not getattr(bot.state, 'account_balance', None):
+        try:
+            bot.state.account_balance = bot.engine.get_funds(force_live=True)
+            bot.state.last_balance_update = now
+        except Exception as e:
+            logger.error(f"Error fetching real account balance: {e}")
+            if not hasattr(bot.state, 'account_balance'):
+                bot.state.account_balance = 0.0
+
+    # Determine Usable Balance based on Manual Capital config
+    manual_cap = float(bot.config.get("MANUAL_CAPITAL", Config.MANUAL_CAPITAL))
+    bot.state.usable_balance = manual_cap
+    bot.state.active_capital = manual_cap
+
+    return {
+        "is_running":         bot.state.is_running,
+        "kill_switch_active": bot.state.kill_switch_active,
+        "daily_pnl":          bot.state.daily_pnl,
+        "trades_taken":       bot.state.trades_taken,
+        "max_trades":         Config.MAX_TRADES_PER_DAY,
+        "market_condition":   bot.state.market_condition,
+        "active_capital":     bot.state.active_capital,
+        "account_balance":    bot.state.account_balance,
+        "usable_balance":     bot.state.usable_balance,
+        "indices":            _shared_state.live_indices,
+        "indices_prev_close": _shared_state.index_prev_close,
+        "active_trades":      bot.tm.active_trades,
+        "mode":               bot.config.get("MODE", "TEST"),
+        "credentials_set":    bool(bot.creds.get("upstox_access_token")),
+        "upstox_updated_at":  bot.creds.get("updated_at"),
+        "ws_live":            market_feed.is_live() if 'market_feed' in globals() else False,
+        "global_halt":        global_halt,
+        "paper_trading":      Config.PAPER_TRADING_MODE or (bot.config.get("MODE", "TEST") == 'TEST'),
+    }
+
+class ToggleRequest(BaseModel):
+    action: str  # "start" or "stop"
+
+@app.post("/api/toggle")
+async def api_toggle(body: ToggleRequest, user: dict = Depends(require_auth), db=Depends(get_db)):
+    from database import UserConfig
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    cfg = db.query(UserConfig).filter(UserConfig.user_id == uid).first()
+    if not cfg:
+        cfg = UserConfig(user_id=uid)
+        db.add(cfg)
+    
+    if body.action == "start":
+        bot.state.is_running = True
+        bot.state.kill_switch_active = False
+        cfg.is_running = 1
+        db.commit()
+        await ensure_user_bot_task(uid, db)
+        return {"status": "started"}
+    else:
+        bot.state.is_running = False
+        cfg.is_running = 0
+        db.commit()
+        return {"status": "stopped"}
 
 @app.post("/api/emergency")
-def api_emergency_stop():
-    logger.critical("EMERGENCY STOP INVOKED MANUALLY!")
-    state.kill_switch_active = True
-    state.is_running = False
+async def api_emergency(user: dict = Depends(require_auth), db=Depends(get_db)):
+    """Emergency square-off for the authenticated user's positions only."""
+    from database import UserConfig
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    bot.state.is_running = False
+    bot.state.kill_switch_active = True
     
-    execution_engine.exit_all_positions()
-    for trade in list(trade_manager.active_trades):
-        trade_manager.close_trade(trade, "EMERGENCY EXIT")
+    cfg = db.query(UserConfig).filter(UserConfig.user_id == uid).first()
+    if cfg:
+        cfg.is_running = 0
+        db.commit()
         
-    return {"status": "success", "message": "All positions squared off."}
+    result = bot.engine.exit_all_positions()
+    for trade in list(bot.tm.active_trades):
+        bot.tm.close_trade(trade, "EMERGENCY", execution_engine=bot.engine)
+    return {"status": "emergency_executed", "engine_result": result}
 
-class ModifySLRequest(BaseModel):
-    new_sl: float
+@app.get("/api/symbols")
+def api_get_symbols(user: dict = Depends(require_auth)):
+    return Config.SYMBOLS_MAPPING
+
+@app.get("/api/config")
+def api_get_config(user: dict = Depends(require_auth), db=Depends(get_db)):
+    """Returns configuration for the CURRENT user."""
+    return get_user_config_dict(db, user["uid"])
+
+@app.post("/api/config")
+async def api_update_config(payload: dict, user: dict = Depends(require_auth), db=Depends(get_db)):
+    """Updates configuration and credentials for the CURRENT user."""
+    from database import UserConfig
+    from credential_service import upsert_credentials
+    from user_bot_registry import reload_user_config, reload_bot_credentials
+    
+    uid = user["uid"]
+    cfg = db.query(UserConfig).filter(UserConfig.user_id == uid).first()
+    if not cfg:
+        cfg = UserConfig(user_id=uid)
+        db.add(cfg)
+    
+    # Update strategy settings
+    if "MAX_TRADES_PER_DAY" in payload: cfg.max_trades_per_day = int(payload["MAX_TRADES_PER_DAY"])
+    if "MAX_OPEN_TRADES" in payload: cfg.max_open_trades = int(payload["MAX_OPEN_TRADES"])
+    if "DAILY_LOSS_LIMIT" in payload: cfg.daily_loss_limit = float(payload["DAILY_LOSS_LIMIT"])
+    if "TRAILING_SL_ACTIVATION" in payload: cfg.trailing_sl_activation = float(payload["TRAILING_SL_ACTIVATION"])
+    if "VOLUME_SPIKE_RATIO" in payload: cfg.volume_spike_ratio = float(payload["VOLUME_SPIKE_RATIO"])
+    if "MIN_CANDLE_STRENGTH" in payload: cfg.min_candle_strength = float(payload["MIN_CANDLE_STRENGTH"])
+    if "MIN_STOCK_PRICE" in payload: cfg.min_stock_price = float(payload["MIN_STOCK_PRICE"])
+    if "MAX_STOCK_PRICE" in payload: cfg.max_stock_price = float(payload["MAX_STOCK_PRICE"])
+    if "USE_GROQ_FILTER" in payload: cfg.use_groq_filter = 1 if payload["USE_GROQ_FILTER"] else 0
+    if "USE_LIVE_CAPITAL" in payload: cfg.use_live_capital = 1 if payload["USE_LIVE_CAPITAL"] else 0
+    if "MANUAL_CAPITAL" in payload: cfg.manual_capital = float(payload["MANUAL_CAPITAL"])
+    if "MODE" in payload: cfg.trading_mode = payload["MODE"].upper()
+    
+    db.commit()
+    
+    # Handle write-only credentials
+    creds_updated = False
+    cred_fields = ["UPSTOX_CLIENT_ID", "UPSTOX_CLIENT_SECRET", "UPSTOX_ACCESS_TOKEN", "ANALYTICS_TOKEN"]
+    if any(k in payload for k in cred_fields):
+        upsert_credentials(
+            db, uid,
+            upstox_client_id=payload.get("UPSTOX_CLIENT_ID"),
+            upstox_client_secret=payload.get("UPSTOX_CLIENT_SECRET"),
+            upstox_access_token=payload.get("UPSTOX_ACCESS_TOKEN"),
+            analytics_token=payload.get("ANALYTICS_TOKEN")
+        )
+        creds_updated = True
+    
+    # Refresh the active bot instance in the registry
+    reload_user_config(uid, db)
+    if creds_updated:
+        reload_bot_credentials(uid, db)
+        
+        # ALSO update the shared components (shared engine & market feed WebSocket)
+        from credential_service import get_decrypted_credentials
+        fresh_creds = get_decrypted_credentials(db, uid)
+        if fresh_creds.get("upstox_access_token"):
+            logger.info(f"Hot-reloading shared engine and market feed with config updated credentials from user {uid}")
+            _shared_engine._creds = fresh_creds
+            
+            # Restart market feed with new credentials
+            market_feed.stop()
+            # Wait a brief moment for it to stop cleanly
+            await asyncio.sleep(1)
+            market_feed.start(
+                _shared_prices, 
+                _shared_state.live_indices, 
+                _shared_state.index_prev_close, 
+                None, 
+                _shared_timestamps,
+                credentials=fresh_creds
+            )
+        
+    return {"status": "updated"}
+
+def get_user_config_dict(db, user_id: int) -> dict:
+    from database import UserConfig
+    cfg = db.query(UserConfig).filter(UserConfig.user_id == user_id).first()
+    if not cfg:
+        # Create default config for this user if none exists
+        cfg = UserConfig(user_id=user_id)
+        db.add(cfg)
+        db.commit()
+        db.refresh(cfg)
+    
+    return {
+        "MAX_TRADES_PER_DAY": cfg.max_trades_per_day,
+        "MAX_OPEN_TRADES": cfg.max_open_trades or 2,
+        "DAILY_LOSS_LIMIT": cfg.daily_loss_limit,
+        "TRAILING_SL_ACTIVATION": cfg.trailing_sl_activation,
+        "VOLUME_SPIKE_RATIO": cfg.volume_spike_ratio,
+        "MIN_CANDLE_STRENGTH": cfg.min_candle_strength,
+        "MIN_STOCK_PRICE": cfg.min_stock_price,
+        "MAX_STOCK_PRICE": cfg.max_stock_price,
+        "USE_GROQ_FILTER": bool(cfg.use_groq_filter),
+        "USE_LIVE_CAPITAL": bool(cfg.use_live_capital),
+        "MANUAL_CAPITAL": cfg.manual_capital,
+        "MODE": cfg.trading_mode or "TEST"
+    }
+
+@app.get("/api/logs")
+def api_get_logs(limit: int = 100, user: dict = Depends(require_auth), db=Depends(get_db)):
+    from database import SystemLog
+    uid = user["uid"]
+    logs = db.query(SystemLog).filter(SystemLog.user_id == uid).order_by(desc(SystemLog.timestamp)).limit(limit).all()
+    return [{
+        "id": l.id, "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+        "level": l.log_level, "event": l.event_type, "message": l.message,
+    } for l in logs]
+
+class ManualTradeRequest(BaseModel):
+    symbol: str
+    side:   str
+    qty:    int
+    price:  float = 0.0
+
+@app.post("/api/trade/manual")
+async def api_manual_trade(
+    body: ManualTradeRequest,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    
+    if len(bot.tm.active_trades) > 0:
+        raise HTTPException(status_code=400, detail="Cannot place manual trade. An active trade already exists.")
+        
+    symbol_key = Config.SYMBOLS_MAPPING.get(body.symbol)
+    if not symbol_key:
+        raise HTTPException(status_code=400, detail="Unknown symbol.")
+    res = bot.engine.place_order_with_retry(
+        symbol_key, body.side, body.qty,
+        order_type="LIMIT" if body.price else "MARKET", price=body.price
+    )
+    return {"status": res.get("status"), "order_id": res.get("order_id")}
+
+class ManualSLUpdate(BaseModel):
+    trade_id:  str
+    new_sl:    float
+    order_id:  Optional[str] = None
+    qty:       Optional[int] = 1
+
+@app.post("/api/trade/update-sl")
+async def api_update_sl(
+    body: ManualSLUpdate,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    trade = next((t for t in bot.tm.active_trades if t['id'] == body.trade_id), None)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+    
+    trade['sl'] = body.new_sl
+    if body.order_id:
+        bot.engine.modify_order(body.order_id, 0, body.new_sl, body.qty or trade.get('qty', 1))
+    
+    try:
+        db_trade = db.query(Trade).filter(Trade.id == body.trade_id, Trade.user_id == uid).first()
+        if db_trade:
+            db_trade.sl_price = body.new_sl
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update SL in DB: {e}")
+        
+    return {"status": "success", "new_sl": body.new_sl}
+
+@app.post("/api/trade/close")
+async def api_close_trade(
+    trade_id: str,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    trade = next((t for t in bot.tm.active_trades if t['id'] == trade_id), None)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+    symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+    if symbol_key:
+        side = "SELL" if trade['side'].upper() == "BUY" else "BUY"
+        bot.engine.place_order_with_retry(symbol_key, side, trade['qty'])
+    bot.tm.close_trade(trade, "MANUAL", execution_engine=bot.engine)
+    return {"status": "success", "trade_id": trade_id}
 
 @app.post("/api/trades/{trade_id}/close")
-def api_close_trade(trade_id: str):
-    target_trade = next((t for t in trade_manager.active_trades if t['id'] == trade_id), None)
-    if not target_trade:
-        return {"status": "error", "message": "Trade not found"}
-        
-    symbol_key = target_trade.get('instrument_token', '')
-    if not symbol_key:
-        return {"status": "error", "message": "Missing instrument token"}
-        
-    # Cancel SL order if any
-    sl_order_id = target_trade.get('sl_order_id')
-    if sl_order_id:
-        import requests
-        try:
-            url = f"{execution_engine.api_v3}/order/cancel?order_id={sl_order_id}"
-            requests.delete(url, headers=execution_engine.headers, timeout=5)
-        except:
-            pass
+async def api_close_trade_path(
+    trade_id: str,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    """Path-parameter endpoint for closing trades as expected by the frontend."""
+    await api_close_trade(trade_id, user, db)
+    return {"status": "success", "trade_id": trade_id}
 
-    # Place market exit order
-    counter_side = "SELL" if target_trade['side'] == "BUY" else "BUY"
-    execution_engine.place_order_with_retry(symbol_key, counter_side, target_trade['qty'])
-    trade_manager.close_trade(target_trade, "MANUAL OVERRIDE")
-    
-    return {"status": "success", "message": "Position closed manually."}
+class PathSLUpdate(BaseModel):
+    new_sl: float
 
 @app.post("/api/trades/{trade_id}/sl")
-def api_modify_sl(trade_id: str, payload: ModifySLRequest):
-    target_trade = next((t for t in trade_manager.active_trades if t['id'] == trade_id), None)
-    if not target_trade:
-        return {"status": "error", "message": "Trade not found"}
+async def api_update_sl_path(
+    trade_id: str,
+    body: PathSLUpdate,
+    user: dict = Depends(require_auth),
+    db=Depends(get_db)
+):
+    """Path-parameter endpoint for modifying Stop Loss as expected by the frontend."""
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    trade = next((t for t in bot.tm.active_trades if t['id'] == trade_id), None)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+    
+    trade['sl'] = body.new_sl
+    qty = trade.get('qty', 1)
+    sl_order_id = trade.get('sl_order_id')
+    if sl_order_id:
+        # Round new SL trigger to tick size (0.05)
+        rounded_trigger = round(body.new_sl * 20) / 20.0
+        bot.engine.modify_order(sl_order_id, 0, rounded_trigger, qty)
         
-    sl_order_id = target_trade.get('sl_order_id')
-    if not sl_order_id:
-        return {"status": "error", "message": "No SL order attached to this trade."}
+    try:
+        db_trade = db.query(Trade).filter(Trade.id == trade_id, Trade.user_id == uid).first()
+        if db_trade:
+            db_trade.sl_price = body.new_sl
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update SL in DB: {e}")
         
-    new_trigger = round(payload.new_sl * 20) / 20.0
-    mod_res = execution_engine.modify_order(
-        order_id=sl_order_id, 
-        new_price=0, 
-        new_trigger=new_trigger, 
-        qty=target_trade['qty'], 
-        order_type="SL-M"
-    )
-    if mod_res.get('status') == 'success':
-        target_trade['sl'] = payload.new_sl
-        return {"status": "success", "message": f"SL updated to {payload.new_sl}"}
+    return {"status": "success", "new_sl": body.new_sl}
+
+# Dual strategy endpoints (shared engine for demo, per-user for live)
+@app.post("/api/dual/start")
+async def dual_start(body: dict, user: dict = Depends(require_auth), db=Depends(get_db)):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    return await bot.dual.start(body)
+
+@app.post("/api/dual/stop")
+async def dual_stop(user: dict = Depends(require_auth), db=Depends(get_db)):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    return bot.dual.stop()
+
+@app.get("/api/dual/status")
+async def dual_status(user: dict = Depends(require_auth), db=Depends(get_db)):
+    uid = user["uid"]
+    bot = get_or_create_bot(uid, db)
+    return bot.dual.get_status()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v2 API ENDPOINTS — Global Kill Switch (Bug Fix 7)
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/admin/halt")
+def admin_halt_trading(user: dict = Depends(require_admin)):
+    """Bug Fix 7: Halt all new entries globally. Existing positions still monitored."""
+    set_global_trading_enabled(False)
+    alert_global_halt_activated()
+    logger.critical(f"[ADMIN] Global halt activated by {user.get('sub', 'unknown')}")
+    return {"status": "halted", "global_trading_enabled": False}
+
+@app.post("/api/admin/resume")
+def admin_resume_trading(user: dict = Depends(require_admin)):
+    """Bug Fix 7: Resume global trading."""
+    set_global_trading_enabled(True)
+    alert_global_halt_lifted()
+    logger.info(f"[ADMIN] Global halt lifted by {user.get('sub', 'unknown')}")
+    return {"status": "resumed", "global_trading_enabled": True}
+
+@app.get("/api/admin/halt")
+def admin_get_halt_status(user: dict = Depends(require_auth)):
+    """Get current global halt status (accessible to all authenticated users for dashboard)."""
+    enabled = get_global_trading_enabled()
+    return {"global_trading_enabled": enabled, "global_halt": not enabled}
+
+# Legacy kill switch endpoint (backwards compat)
+@app.post("/api/admin/kill-switch")
+def toggle_global_kill_switch(active: bool, user: dict = Depends(require_admin)):
+    set_global_trading_enabled(not active)
+    if active:
+        alert_global_halt_activated()
     else:
-        return {"status": "error", "message": "Failed to update SL physically via Upstox API."}
+        alert_global_halt_lifted()
+    return {"status": "success", "global_kill_switch": active}
+
+@app.get("/api/admin/kill-switch")
+def get_global_kill_switch(user: dict = Depends(require_admin)):
+    enabled = get_global_trading_enabled()
+    return {"global_kill_switch": not enabled}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v2 API ENDPOINTS — Watchlist, Signal Log, Feed Health, Pipeline Stats
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/watchlist/morning")
+def api_get_morning_watchlist(user: dict = Depends(require_auth)):
+    """Return today's morning watchlist."""
+    from database import MorningWatchlist
+    db = SessionLocal()
+    try:
+        from database import get_ist_date
+        today = get_ist_date()
+        rows = db.query(MorningWatchlist).filter(MorningWatchlist.date == today).all()
+        return [{
+            "symbol": r.symbol, "direction_bias": r.direction_bias,
+            "vol_ratio_20day": r.vol_ratio_20day,
+            "relative_strength_5day": r.relative_strength_5day,
+        } for r in rows]
+    finally:
+        db.close()
+
+@app.get("/api/watchlist/active")
+def api_get_active_watchlist(user: dict = Depends(require_auth)):
+    """Return today's active watchlist (non-removed stocks)."""
+    from database import ActiveWatchlist
+    db = SessionLocal()
+    try:
+        from database import get_ist_date
+        today = get_ist_date()
+        rows = db.query(ActiveWatchlist).filter(
+            ActiveWatchlist.date == today,
+            ActiveWatchlist.removed_at.is_(None)
+        ).all()
+        return [{
+            "symbol": r.symbol, "direction_bias": r.direction_bias,
+            "added_at": r.added_at.isoformat() if r.added_at else None,
+        } for r in rows]
+    finally:
+        db.close()
+
+@app.get("/api/signal-log")
+def api_get_signal_log(user: dict = Depends(require_auth)):
+    """Return last 50 signal log entries for the dashboard."""
+    return _signal_log
+
+@app.get("/api/feed-health")
+def api_get_feed_health(user: dict = Depends(require_auth)):
+    """Return feed freshness status for dashboard indicator."""
+    return market_feed.get_feed_health_summary()
+
+@app.get("/api/pipeline-stats")
+def api_get_pipeline_stats(user: dict = Depends(require_auth)):
+    """Return pipeline statistics for daily summary display."""
+    return _pipeline_stats
+
+
