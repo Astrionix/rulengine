@@ -436,7 +436,7 @@ async def user_trading_cycle(user_id: int):
     Per-user trading cycle — v2 pipeline-based.
     Runs as its own asyncio Task. Implements the full daily schedule (Section 7).
     """
-    global _signal_log, _pipeline_stats
+    global _signal_log, _pipeline_stats, latest_signals
 
     from user_bot_registry import get_bot
     bot = get_bot(user_id)
@@ -900,6 +900,33 @@ async def user_trading_cycle(user_id: int):
                 )
                 _pipeline_stats["layer3_signals"] += len(signals)
 
+                # Map Layer 3 signals to UI
+                if not signals:
+                    latest_signals = []
+                else:
+                    ui_signals = []
+                    for s in signals:
+                        ui_signals.append({
+                            "symbol": s["symbol"],
+                            "decision": "AVOID",  # Default watch state at Layer 3
+                            "score": int(s["conditions_met"] / 5 * 100),
+                            "entry_price": s["ltp"],
+                            "current_price": s["ltp"],
+                            "metadata": {
+                                "breakout_level": s.get("ema_20"),
+                                "breakdown_level": s.get("ema_20"),
+                                "vwap": s.get("vwap"),
+                                "volume_ratio": s.get("vol_ratio_6bar"),
+                                "rr_ratio": 2.0,
+                                "atr_pct": 1.0,
+                                "breakout": s.get("price_vs_vwap", 0) > 0.15 or s.get("price_vs_vwap", 0) < -0.15,
+                                "volume_spike": s.get("vol_ratio_6bar", 0) >= 2.0,
+                                "strong_candle": s.get("candle_strength", 0) >= 0.50,
+                                "vwap_aligned": True
+                            }
+                        })
+                    latest_signals = ui_signals
+
                 # Log signals for dashboard
                 for sig in signals:
                     _add_signal_log(f"[{now.strftime('%H:%M')}] {sig['symbol']} {sig['direction']} — {sig['conditions_met']}/5 conditions met")
@@ -943,6 +970,37 @@ async def user_trading_cycle(user_id: int):
                                     f"[{now.strftime('%H:%M')}] {d['symbol']} → {color_label} "
                                     f"({source_label} confidence: {d.get('confidence', 0)}/5) — {d.get('reasoning', '')[:80]}"
                                 )
+
+                            # Map decisions to UI
+                            ui_decisions = []
+                            for d in decisions:
+                                payload = next((p for p in feature_payloads if p["symbol"] == d["symbol"]), None)
+                                m = {}
+                                if payload:
+                                    pc = payload.get("price_context", {})
+                                    lv = payload.get("levels", {})
+                                    ind = payload.get("indicators", {})
+                                    m = {
+                                        "breakout_level": lv.get("resistance_20bar_5min"),
+                                        "breakdown_level": lv.get("support_20bar_5min"),
+                                        "vwap": pc.get("vwap_5min"),
+                                        "volume_ratio": payload.get("volume", {}).get("vol_ratio_6bar"),
+                                        "rr_ratio": 2.0,
+                                        "atr_pct": round(pc.get("atr_pct_5min", 0), 2),
+                                        "breakout": ind.get("breakout_detected", False),
+                                        "volume_spike": ind.get("volume_spike", False),
+                                        "strong_candle": ind.get("momentum_candle", False),
+                                        "vwap_aligned": ind.get("vwap_aligned", False)
+                                    }
+                                ui_decisions.append({
+                                    "symbol": d["symbol"],
+                                    "decision": "BUY" if d.get("decision") == "ENTER" and d.get("direction") == "LONG" else "SELL" if d.get("decision") == "ENTER" and d.get("direction") == "SHORT" else "AVOID",
+                                    "score": int(d.get("confidence", 0) * 20),
+                                    "entry_price": d.get("entry_price", 0.0),
+                                    "current_price": _shared_prices.get(d["symbol"], 0.0),
+                                    "metadata": m
+                                })
+                            latest_signals = ui_decisions
 
                             # Process ENTER decisions
                             enter_decisions = layer5.get_enter_decisions(decisions)
