@@ -358,6 +358,44 @@ def run_local_rule_analysis(feature_payloads: list) -> list:
         elif direction == "SHORT" and rsi_14_daily < 28:
             confidence -= 1
             red_flags.append("oversold daily RSI")
+
+        # Leading Index Trend (Bank Nifty - Gap 1)
+        bn_slope = payload["market_context"].get("bank_nifty_slope", "flat")
+        bn_change = payload["market_context"].get("bank_nifty_change_3bar_pct", 0.0)
+        if direction == "LONG":
+            if bn_slope == "falling" and bn_change < -0.15:
+                confidence -= 1
+                red_flags.append("bank nifty counter-trend")
+            if bn_slope == "falling" and bn_change < -0.30:
+                decision_val = "SKIP"
+                reason = f"Bank Nifty is falling strongly ({bn_change:.2f}%)."
+                red_flags.append("bank nifty counter-trend")
+        elif direction == "SHORT":
+            if bn_slope == "rising" and bn_change > 0.15:
+                confidence -= 1
+                red_flags.append("bank nifty counter-trend")
+            if bn_slope == "rising" and bn_change > 0.30:
+                decision_val = "SKIP"
+                reason = f"Bank Nifty is rising strongly (+{bn_change:.2f}%)."
+                red_flags.append("bank nifty counter-trend")
+
+        # Previous Day High/Low Confirmation (Gap 2)
+        cleared_pdh = payload["levels"].get("cleared_previous_day_high", False)
+        cleared_pdl = payload["levels"].get("cleared_previous_day_low", False)
+        if direction == "LONG":
+            if cleared_pdh:
+                confidence += 1
+            else:
+                if vol_ratio <= 4.0:
+                    confidence -= 1
+                    red_flags.append("inside yesterday range")
+        elif direction == "SHORT":
+            if cleared_pdl:
+                confidence += 1
+            else:
+                if vol_ratio <= 4.0:
+                    confidence -= 1
+                    red_flags.append("inside yesterday range")
             
         confidence = max(1, min(5, confidence))
         if confidence < 3:
@@ -789,6 +827,24 @@ async def user_trading_cycle(user_id: int):
                     elif "RANGING" in market_regime or "HIGH_VOLATILITY" in market_regime:
                         target_multiplier = 1.5
 
+                    # Fetch daily candles to get Yesterday's High/Low (Gap 2)
+                    prev_day_high = 0.0
+                    prev_day_low = 0.0
+                    try:
+                        symbol_key = orb_sig["instrument_key"]
+                        daily_df = bot.engine.get_historical_candles_daily(symbol_key, days=5)
+                        if not daily_df.empty:
+                            last_date = daily_df.iloc[-1]['timestamp'].date()
+                            today_date = datetime.now(IST).date()
+                            if last_date == today_date and len(daily_df) >= 2:
+                                yesterday_row = daily_df.iloc[-2]
+                            else:
+                                yesterday_row = daily_df.iloc[-1]
+                            prev_day_high = float(yesterday_row['high'])
+                            prev_day_low = float(yesterday_row['low'])
+                    except Exception as e:
+                        logger.error(f"Failed to fetch daily candles for ORB stock {orb_sig['symbol']}: {e}")
+
                     orb_payload = {
                         "symbol": orb_sig["symbol"],
                         "target_multiplier": target_multiplier,
@@ -815,9 +871,15 @@ async def user_trading_cycle(user_id: int):
                             "resistance_20bar_5min": orb_sig["orb_high"],
                             "distance_to_resistance_pct": abs(orb_sig["orb_high"] - orb_sig["ltp"]) / orb_sig["ltp"] * 100,
                             "distance_to_support_pct": abs(orb_sig["ltp"] - orb_sig["orb_low"]) / orb_sig["ltp"] * 100,
+                            "previous_day_high": round(prev_day_high, 2) if prev_day_high > 0 else 0.0,
+                            "previous_day_low": round(prev_day_low, 2) if prev_day_low > 0 else 0.0,
+                            "cleared_previous_day_high": bool(orb_sig["ltp"] > prev_day_high) if prev_day_high > 0 else False,
+                            "cleared_previous_day_low": bool(orb_sig["ltp"] < prev_day_low) if prev_day_low > 0 else False,
                         },
                         "market_context": {
                             "nifty_trend_today": layer4.get_nifty_trend(),
+                            "bank_nifty_slope": getattr(layer4, '_bank_nifty_trend', {}).get('slope', 'flat'),
+                            "bank_nifty_change_3bar_pct": getattr(layer4, '_bank_nifty_trend', {}).get('change_3bar_pct', 0.0),
                             "india_vix": vix_ltp,
                             "sector": "Unknown",
                             "sector_vs_nifty_today_pct": 0.0,

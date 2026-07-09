@@ -37,6 +37,7 @@ class FeatureExtractor:
         
         # Market context cache
         self._nifty_trend = {"trend": "sideways", "change_pct": 0.0, "last_refresh": 0}
+        self._bank_nifty_trend = {"slope": "flat", "change_3bar_pct": 0.0, "last_refresh": 0}
         self._vix_value = {"value": 0.0, "last_refresh": 0}
         self._sector_perf = {}  # {sector: pct_vs_nifty, "last_refresh": 0}
         self._sector_refresh_time = 0
@@ -116,6 +117,19 @@ class FeatureExtractor:
         if not daily_df.empty and len(daily_df) >= 20:
             high_20d = daily_df['high'].iloc[-20:].max()
             price_vs_20day_high = ((ltp - high_20d) / high_20d) * 100
+
+        # Yesterday's High/Low Context (Gap 2)
+        prev_day_high = 0.0
+        prev_day_low = 0.0
+        if not daily_df.empty:
+            last_date = daily_df.iloc[-1]['timestamp'].date()
+            today_date = datetime.now(IST).date()
+            if last_date == today_date and len(daily_df) >= 2:
+                yesterday_row = daily_df.iloc[-2]
+            else:
+                yesterday_row = daily_df.iloc[-1]
+            prev_day_high = float(yesterday_row['high'])
+            prev_day_low = float(yesterday_row['low'])
 
         # ── Momentum ──────────────────────────────────────────────────────
         rsi_14_5min = float(latest.get('rsi_14', 50.0))
@@ -285,11 +299,17 @@ class FeatureExtractor:
                 "resistance_20bar_5min": round(resistance_20bar, 2),
                 "distance_to_resistance_pct": round(dist_to_resistance, 2),
                 "distance_to_support_pct": round(dist_to_support, 2),
+                "previous_day_high": round(prev_day_high, 2) if prev_day_high > 0 else 0.0,
+                "previous_day_low": round(prev_day_low, 2) if prev_day_low > 0 else 0.0,
+                "cleared_previous_day_high": bool(ltp > prev_day_high) if prev_day_high > 0 else False,
+                "cleared_previous_day_low": bool(ltp < prev_day_low) if prev_day_low > 0 else False,
             },
 
             "market_context": {
                 "market_regime": market_regime,
                 "nifty_trend_today": self._nifty_trend.get("trend", "sideways"),
+                "bank_nifty_slope": self._bank_nifty_trend.get("slope", "flat"),
+                "bank_nifty_change_3bar_pct": self._bank_nifty_trend.get("change_3bar_pct", 0.0),
                 "india_vix": round(self._vix_value.get("value", 0), 1),
                 "sector": sector,
                 "sector_vs_nifty_today_pct": round(sector_vs_nifty, 2),
@@ -358,6 +378,42 @@ class FeatureExtractor:
         if (now - self._vix_value.get("last_refresh", 0)) > Config.MARKET_DATA_REFRESH_MIN * 60:
             vix = indices_cache.get("NSE_INDEX|India VIX", 0)
             self._vix_value = {"value": vix, "last_refresh": now}
+
+        # Bank Nifty slope — refresh every 5 minutes
+        if (now - self._bank_nifty_trend.get("last_refresh", 0)) > 5 * 60:
+            try:
+                df_bn = self.engine.get_ohlc("NSE_INDEX|Nifty Bank", interval="5minute")
+                if not df_bn.empty and len(df_bn) >= 5:
+                    df_bn = compute_features(df_bn)
+                    latest_bn = df_bn.iloc[-2]  # Completed candle
+                    prev_bn = df_bn.iloc[-3] if len(df_bn) >= 3 else latest_bn
+                    
+                    ema_bn_now = float(latest_bn.get("ema_20", 0))
+                    ema_bn_prev = float(prev_bn.get("ema_20", 0))
+                    
+                    close_bn_now = float(latest_bn["close"])
+                    close_bn_prev = float(prev_bn["close"])
+                    
+                    roc_3bar = 0.0
+                    if len(df_bn) >= 5:
+                        old_close = float(df_bn.iloc[-4]["close"])
+                        if old_close > 0:
+                            roc_3bar = ((close_bn_now - old_close) / old_close) * 100
+                            
+                    if ema_bn_now > ema_bn_prev * 1.0005:
+                        slope = "rising"
+                    elif ema_bn_now < ema_bn_prev * 0.9995:
+                        slope = "falling"
+                    else:
+                        slope = "flat"
+                        
+                    self._bank_nifty_trend = {
+                        "slope": slope,
+                        "change_3bar_pct": round(roc_3bar, 3),
+                        "last_refresh": now
+                    }
+            except Exception as bne:
+                logger.error(f"Failed to fetch Bank Nifty candles for slope: {bne}")
 
         # ── IMPROVEMENT 6: Sector performance — refresh every 30 minutes ─
         # Maps available Upstox index keys to sector names used in SECTOR_MAP.

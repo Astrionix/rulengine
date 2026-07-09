@@ -154,6 +154,16 @@ RELATIVE STRENGTH FILTER:
 VOLUME DIVERGENCE FILTER:
   If volume_divergence is true → downgrade confidence by 1 and note "volume divergence" in red_flags.
 
+LEADING INDEX trend (BANK NIFTY - GAP 1):
+  Evaluate bank_nifty_slope and bank_nifty_change_3bar_pct under market_context:
+  - For LONG: if bank_nifty_slope is "falling" AND bank_nifty_change_3bar_pct < -0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags. If bank_nifty_slope is "falling" AND bank_nifty_change_3bar_pct < -0.30% (strong drop) → return SKIP.
+  - For SHORT: if bank_nifty_slope is "rising" AND bank_nifty_change_3bar_pct > 0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags. If bank_nifty_slope is "rising" AND bank_nifty_change_3bar_pct > 0.30% (strong rise) → return SKIP.
+
+PREVIOUS DAY HIGH/LOW CONFIRMATION (GAP 2):
+  Evaluate cleared_previous_day_high and cleared_previous_day_low under levels:
+  - For LONG: if cleared_previous_day_high is true → upgrade confidence by 1 (max 5) and note "cleared previous day high" in reasoning. If cleared_previous_day_high is false (price remains inside yesterday's range) → downgrade confidence by 1 unless vol_ratio_6bar_5min is exceptionally high (> 4.0).
+  - For SHORT: if cleared_previous_day_low is true → upgrade confidence by 1 (max 5) and note "cleared previous day low" in reasoning. If cleared_previous_day_low is false (price remains inside yesterday's range) → downgrade confidence by 1 unless vol_ratio_6bar_5min is exceptionally high (> 4.0).
+
 ─── RED FLAG DETECTION ──────────────────────────────────────────────────────────
 Always check for and report any of the following as red_flags (comma-separated string):
   - "volume declining": last candle volume is lower than both of the previous two candles
@@ -167,6 +177,8 @@ Always check for and report any of the following as red_flags (comma-separated s
   - "strong relative strength against short": stock_vs_nifty_5day_pct > 0 for SHORT
   - "extended daily RSI": rsi_14_daily > 72 for LONG (stock overbought on daily chart)
   - "oversold daily RSI": rsi_14_daily < 28 for SHORT (stock oversold on daily chart)
+  - "bank nifty counter-trend": Bank Nifty slope/change is moving against trade direction
+  - "inside yesterday range": price has not cleared yesterday's high (for LONG) or low (for SHORT)
 If none of the above are present, set red_flags to "none"."""
 
 
