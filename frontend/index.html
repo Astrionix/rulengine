@@ -3567,7 +3567,7 @@
                     <div id="v-exit-btn"></div>
                 </div>
                 <div id="active-trades"
-                    style="width: 100%; display: flex; flex-direction: row; align-items: center; flex: 1;">
+                    style="width: 100%; display: flex; flex-direction: column; align-items: stretch; flex: 1; max-height: 220px; overflow-y: auto; gap: 8px;">
                     <div style="font-size: 11px; color: var(--muted); text-align: center;">System scanning for
                         opportunities...</div>
                 </div>
@@ -4390,38 +4390,17 @@
 
                 if (symEl && labelEl && exitBtnEl) {
                     if (trades.length > 0) {
-                        labelEl.style.display = 'none';
-                        const t0 = trades[0];
-                        const isBuy = t0.side === 'BUY';
-                        const pnl = parseFloat(t0.pnl || 0);
-                        const isProfit = pnl >= 0;
-
-                        symEl.innerHTML = `
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <span class="pulse-dot"></span>
-                                <span style="font-size:14px;font-weight:800;color:var(--text);letter-spacing:-.2px;">${t0.symbol}</span>
-                                <span style="font-size:8px;font-weight:800;padding:1px 6px;border-radius:3px;letter-spacing:.5px;
-                                    color:${isBuy ? 'var(--green)' : 'var(--red)'};
-                                    background:${isBuy ? 'rgba(0,230,118,.1)' : 'rgba(255,59,59,.1)'};
-                                    border:1px solid ${isBuy ? 'rgba(0,230,118,.2)' : 'rgba(255,59,59,.2)'}">${t0.side}</span>
-                                <span style="font-size:10px;font-weight:700;color:var(--muted);background:var(--badge-bg);padding:1px 6px;border-radius:3px;font-family:'JetBrains Mono';">${t0.qty}</span>
-                                <span style="font-size:13px;font-weight:800;color:var(--text);font-family:'JetBrains Mono';background:var(--bg-panel-hover);padding:2px 8px;border-radius:4px;" id="active-p-${t0.symbol}">₹${(window._latestPrices && window._latestPrices[t0.symbol] ? window._latestPrices[t0.symbol] : t0.entry_price).toFixed(2)}</span>
-                            </div>`;
-
-                        exitBtnEl.innerHTML = `
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <button onclick="openModifySL('${t0.id}',${t0.sl})" style="height:26px;width:90px;border-radius:4px;font-size:9px;font-weight:700;cursor:pointer;background:var(--bg-panel);color:var(--text);border:1px solid var(--border-light);font-family:'Inter';transition:all .2s;white-space:nowrap;display:flex;align-items:center;justify-content:center;" onmouseenter="this.style.borderColor='var(--blue)';this.style.color='var(--blue)';this.style.background='var(--bg-panel-hover)'" onmouseleave="this.style.borderColor='var(--border-light)';this.style.color='var(--text)';this.style.background='var(--bg-panel)'">MODIFY SL</button>
-                                <button onclick="closeTrade('${t0.id}')" style="height:26px;width:90px;border-radius:4px;font-size:9px;font-weight:800;cursor:pointer;background:rgba(255,59,59,0.15);color:var(--red);border:1px solid rgba(255,59,59,0.3);font-family:'Inter';white-space:nowrap;transition:all .2s;display:flex;align-items:center;justify-content:center;" onmouseenter="this.style.background='var(--red)';this.style.color='white';this.style.borderColor='var(--red)'" onmouseleave="this.style.background='rgba(255,59,59,0.15)';this.style.color='var(--red)';this.style.borderColor='rgba(255,59,59,0.3)'">EXIT</button>
-                            </div>`;
+                        labelEl.textContent = `Active Positions (${trades.length})`;
+                        labelEl.style.display = 'block';
+                        symEl.innerHTML = '';
+                        exitBtnEl.innerHTML = '';
                     } else {
+                        labelEl.textContent = 'Active Position';
                         labelEl.style.display = 'block';
                         symEl.innerHTML = '';
                         exitBtnEl.innerHTML = '';
                     }
                 }
-
-
-
 
                 const pnlEl = document.getElementById('r-open-pnl');
                 if (pnlEl) {
@@ -4435,42 +4414,60 @@
                 }
 
                 if (trades.length === 0) {
-                    box.innerHTML = '<div style="font-size: 11px; color: var(--muted); text-align: center;">No active trades. System scanning for opportunities...</div>';
+                    box.innerHTML = '<div style="font-size: 11px; color: var(--muted); text-align: center; padding: 10px 0;">No active trades. System scanning for opportunities...</div>';
                     return;
                 }
-
 
                 let html = '';
                 trades.forEach(t => {
                     const entry = parseFloat(t.entry_price);
-                    const current = parseFloat(t.current_price);
+                    const current = parseFloat(t.current_price || entry);
                     const sl = parseFloat(t.sl);
                     const pnl = parseFloat(t.pnl || 0);
                     const qty = t.qty || 0;
                     const isProfit = pnl >= 0;
+                    const isBuy = t.side === 'BUY';
 
                     html += `
-            <div style="display:flex;align-items:center;gap:12px;width:100%;">
-                <div style="display:grid;grid-template-columns:repeat(4,1fr);flex:1;border-radius:4px;overflow:hidden;background:transparent;border:1px solid var(--border);">
-                    <div style="padding:4px 6px;text-align:center;border-right:1px solid var(--border);">
-                        <div style="font-size:7px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:2px;">Time</div>
-                        <div style="font-size:10px;font-weight:700;font-family:'JetBrains Mono';">${t.timestamp.split('T')[1].substring(0, 5)}</div>
+            <div style="display: flex; flex-direction: column; gap: 8px; width: 100%; padding: 8px 0; border-bottom: 1px solid var(--border-light);">
+                <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span class="pulse-dot"></span>
+                        <span style="font-size: 13px; font-weight: 800; color: var(--text); letter-spacing: -.2px;">${t.symbol}</span>
+                        <span style="font-size: 8px; font-weight: 800; padding: 1px 6px; border-radius: 3px; letter-spacing: .5px;
+                            color: ${isBuy ? 'var(--green)' : 'var(--red)'};
+                            background: ${isBuy ? 'rgba(0,230,118,.1)' : 'rgba(255,59,59,.1)'};
+                            border: 1px solid ${isBuy ? 'rgba(0,230,118,.2)' : 'rgba(255,59,59,.2)'}">${t.side}</span>
+                        <span style="font-size: 9px; font-weight: 700; color: var(--muted); background: var(--badge-bg); padding: 1px 5px; border-radius: 3px; font-family: 'JetBrains Mono';">${qty}</span>
+                        <span style="font-size: 11px; font-weight: 800; color: var(--text); font-family: 'JetBrains Mono'; background: var(--bg-panel-hover); padding: 1px 6px; border-radius: 4px;" id="active-p-${t.symbol}">₹${current.toFixed(2)}</span>
                     </div>
-                    <div style="padding:4px 6px;text-align:center;border-right:1px solid var(--border);">
-                        <div style="font-size:7px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:2px;">Entry</div>
-                        <div style="font-size:10px;font-weight:700;font-family:'JetBrains Mono';">₹${entry.toFixed(2)}</div>
-                    </div>
-                    <div style="padding:4px 6px;text-align:center;border-right:1px solid var(--border);">
-                        <div style="font-size:7px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:2px;">SL</div>
-                        <div style="font-size:10px;font-weight:700;font-family:'JetBrains Mono';color:var(--red);">₹${sl.toFixed(2)}</div>
-                    </div>
-                    <div style="padding:4px 6px;text-align:center;">
-                        <div style="font-size:7px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:2px;">Target</div>
-                        <div style="font-size:10px;font-weight:700;font-family:'JetBrains Mono';color:var(--green);">₹${parseFloat(t.target || 0).toFixed(2)}</div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <button onclick="openModifySL('${t.id}',${sl})" style="height: 22px; padding: 0 8px; border-radius: 4px; font-size: 8px; font-weight: 700; cursor: pointer; background: var(--bg-panel); color: var(--text); border: 1px solid var(--border-light); font-family: 'Inter';" onmouseenter="this.style.borderColor='var(--blue)';this.style.color='var(--blue)';this.style.background='var(--bg-panel-hover)'" onmouseleave="this.style.borderColor='var(--border-light)';this.style.color='var(--text)';this.style.background='var(--bg-panel)'">MODIFY SL</button>
+                        <button onclick="closeTrade('${t.id}')" style="height: 22px; padding: 0 8px; border-radius: 4px; font-size: 8px; font-weight: 800; cursor: pointer; background: rgba(255,59,59,0.15); color: var(--red); border: 1px solid rgba(255,59,59,0.3); font-family: 'Inter';" onmouseenter="this.style.background='var(--red)';this.style.color='white';this.style.borderColor='var(--red)'" onmouseleave="this.style.background='rgba(255,59,59,0.15)';this.style.color='var(--red)';this.style.borderColor='rgba(255,59,59,0.3)'">EXIT</button>
                     </div>
                 </div>
-                <div style="display:flex;align-items:center;flex-shrink:0;">
-                    <span style="font-size:20px;font-weight:800;font-family:'JetBrains Mono';color:${isProfit ? 'var(--green)' : 'var(--red)'}; white-space:nowrap;">${isProfit ? '+' : '−'}₹${Math.abs(pnl).toFixed(2)}</span>
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%;">
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); flex: 1; border-radius: 4px; overflow: hidden; border: 1px solid var(--border);">
+                        <div style="padding: 2px 4px; text-align: center; border-right: 1px solid var(--border);">
+                            <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Time</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono';">${t.timestamp ? t.timestamp.split('T')[1].substring(0, 5) : '--:--'}</div>
+                        </div>
+                        <div style="padding: 2px 4px; text-align: center; border-right: 1px solid var(--border);">
+                            <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Entry</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono';">₹${entry.toFixed(2)}</div>
+                        </div>
+                        <div style="padding: 2px 4px; text-align: center; border-right: 1px solid var(--border);">
+                            <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">SL</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono'; color: var(--red);">₹${sl.toFixed(2)}</div>
+                        </div>
+                        <div style="padding: 2px 4px; text-align: center;">
+                            <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Target</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono'; color: var(--green);">₹${parseFloat(t.target || 0).toFixed(2)}</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; align-items: center; flex-shrink: 0; min-width: 70px; justify-content: flex-end;">
+                        <span style="font-size: 15px; font-weight: 800; font-family: 'JetBrains Mono'; color: ${isProfit ? 'var(--green)' : 'var(--red)'}; white-space: nowrap;">${isProfit ? '+' : '−'}₹${Math.abs(pnl).toFixed(2)}</span>
+                    </div>
                 </div>
             </div>`;
                 });
