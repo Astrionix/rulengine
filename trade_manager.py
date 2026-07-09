@@ -283,7 +283,22 @@ class TradeManager:
 
         # If a physically new SL triggers, process it on the server
         if abs(rounded_new_sl - rounded_current_sl) >= 0.05:
-            if execution_engine:
+            if str(sl_order_id).startswith("virtual_"):
+                trade['sl'] = rounded_new_sl
+                logger.info(f"VIRTUAL Trailing SL updated for {trade['symbol']} to {rounded_new_sl}")
+                
+                # Update DB
+                db = SessionLocal()
+                try:
+                    db_trade = db.query(Trade).filter(Trade.id == trade['id']).first()
+                    if db_trade:
+                        db_trade.sl_price = rounded_new_sl
+                        db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to update virtual SL in DB: {e}")
+                finally:
+                    db.close()
+            elif execution_engine:
                 symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
                 
                 # 1. Cancel existing SL order
@@ -341,7 +356,7 @@ class TradeManager:
         
         # Cancel stop loss order on the broker side if execution_engine and sl_order_id are available
         sl_order_id = trade.get('sl_order_id')
-        if sl_order_id and execution_engine:
+        if sl_order_id and execution_engine and not str(sl_order_id).startswith("virtual_"):
             try:
                 logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
                 execution_engine.cancel_order(sl_order_id)

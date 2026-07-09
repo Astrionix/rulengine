@@ -431,7 +431,7 @@ def _evaluate_market_regime(bot, user_id, layer4, participation_ratio):
         alert_telegram(f"⚠️ Market regime dynamically updated from {old_regime} to {new_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
 
 
-async def trading_cycle_task(user_id: int):
+async def user_trading_cycle(user_id: int):
     """
     Per-user trading cycle — v2 pipeline-based.
     Runs as its own asyncio Task. Implements the full daily schedule (Section 7).
@@ -1100,19 +1100,28 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     else:
         res = bot.engine.place_order_with_retry(symbol_key, side, quantity)
         
+        is_virtual = False
         if res.get('status') == 'unknown':
             # Bug Fix 1: Order status unknown
             alert_order_status_unknown(symbol, res.get('order_id', 'N/A'))
             add_to_daily_blacklist(user_id, symbol)
             return
-        
-        if res.get('status') != 'success':
+            
+        if res.get('status') == 'rejected':
+            logger.warning(f"[USER {user_id}] Broker REJECTED order for {symbol}. Falling back to Hybrid Virtual Trading.")
+            send_alert(user_id, f"⚠️ Broker rejected {side} order for {symbol} (likely margin limit). Continuing trade VIRTUALLY.")
+            is_virtual = True
+            import uuid
+            order_id = f"virtual_{symbol}_{side}_{str(uuid.uuid4())[:6]}"
+            filled_qty = quantity
+            actual_entry = entry_price
+        elif res.get('status') != 'success':
             send_alert(user_id, f"Entry order placement failed for {symbol} ({side}).")
             return
- 
-        order_id = res.get('order_id')
-        filled_qty = res.get('filled_quantity', quantity)
-        actual_entry = res.get('average_price', entry_price) or entry_price
+        else:
+            order_id = res.get('order_id')
+            filled_qty = res.get('filled_quantity', quantity)
+            actual_entry = res.get('average_price', entry_price) or entry_price
  
         # Bug Fix 2: Check filled quantity
         if filled_qty <= 0:
@@ -1123,15 +1132,19 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     # Step 6 — Place SL order
     sl_order_id = None
     if not is_paper:
-        sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
-        if sl_res.get('status') != 'success':
-            send_alert(user_id, f"SL order placement failed for {symbol}. Emergency square-off!")
-            counter_side = "SELL" if side == "BUY" else "BUY"
-            exit_res = bot.engine.place_order_with_retry(symbol_key, counter_side, filled_qty)
-            if exit_res.get('status') != 'success':
-                send_alert(user_id, f"FATAL: Emergency square-off failed for {symbol}! Manual intervention required!")
-            return
-        sl_order_id = sl_res.get('order_id')
+        if is_virtual:
+            import uuid
+            sl_order_id = f"virtual_sl_{symbol}_{str(uuid.uuid4())[:6]}"
+        else:
+            sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
+            if sl_res.get('status') != 'success':
+                send_alert(user_id, f"SL order placement failed for {symbol}. Emergency square-off!")
+                counter_side = "SELL" if side == "BUY" else "BUY"
+                exit_res = bot.engine.place_order_with_retry(symbol_key, counter_side, filled_qty)
+                if exit_res.get('status') != 'success':
+                    send_alert(user_id, f"FATAL: Emergency square-off failed for {symbol}! Manual intervention required!")
+                return
+            sl_order_id = sl_res.get('order_id')
  
     # Step 7 — Persist to database
     bot.tm.add_trade(
@@ -1142,6 +1155,7 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
         probability=0.0, score=confidence,
         sl_order_id=sl_order_id,
         metadata={
+            'is_virtual': is_virtual if not is_paper else False,
             'confidence': confidence,
             'reasoning': reasoning,
             'layer3_conditions_met': conditions_met,
