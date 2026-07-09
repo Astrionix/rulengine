@@ -4450,7 +4450,7 @@
                     <div style="display: grid; grid-template-columns: repeat(4, 1fr); flex: 1; border-radius: 4px; overflow: hidden; border: 1px solid var(--border);">
                         <div style="padding: 2px 4px; text-align: center; border-right: 1px solid var(--border);">
                             <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Time</div>
-                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono';">${t.timestamp ? t.timestamp.split('T')[1].substring(0, 5) : '--:--'}</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono';">${t.timestamp && t.timestamp.includes('T') ? t.timestamp.split('T')[1].substring(0, 5) : (t.timestamp && t.timestamp.includes(' ') ? t.timestamp.split(' ')[1].substring(0, 5) : '--:--')}</div>
                         </div>
                         <div style="padding: 2px 4px; text-align: center; border-right: 1px solid var(--border);">
                             <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Entry</div>

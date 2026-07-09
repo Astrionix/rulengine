@@ -384,7 +384,7 @@ class FeatureExtractor:
             try:
                 df_bn = self.engine.get_ohlc("NSE_INDEX|Nifty Bank", interval="5minute")
                 if not df_bn.empty and len(df_bn) >= 5:
-                    df_bn = compute_features(df_bn)
+                    df_bn['ema_20'] = df_bn['close'].ewm(span=20, adjust=False).mean()
                     latest_bn = df_bn.iloc[-2]  # Completed candle
                     prev_bn = df_bn.iloc[-3] if len(df_bn) >= 3 else latest_bn
                     
