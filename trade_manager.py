@@ -411,6 +411,13 @@ class TradeManager:
         logger.info(f"Trade closed: {trade['id']}, Reason: {reason}, PnL: {trade['pnl']}, Consecutive Losses: {self.consecutive_losses}")
         trade_logger.info(f"CLOSED TRADE: [id={trade['id']}, symbol={trade['symbol']}, reason={reason}, final_pnl={trade['pnl']}, exit_price={trade['current_price']}]")
 
+        # Telegram Alert for Exit
+        try:
+            from telegram_alert import alert_trade_exit
+            alert_trade_exit(trade['symbol'], reason, trade['entry_price'], trade['current_price'], trade['pnl'])
+        except Exception as ta_err:
+            logger.error(f"Failed to send trade exit alert: {ta_err}")
+
         # Update Database
         db = SessionLocal()
         try:
