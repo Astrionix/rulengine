@@ -300,17 +300,33 @@ class UpstoxExecutionEngine:
                             ts = pytz.timezone('Asia/Kolkata').localize(ts)
                             age = (now - ts).total_seconds()
                             if age <= max_age_seconds:
-                                return {
-                                    "status": "success", 
-                                    "order_id": o.get('order_id'), 
-                                    "order_status": o.get('status'), 
-                                    "filled_quantity": int(o.get('filled_quantity', 0))
-                                }
+                                order_status = str(o.get('status', '')).lower()
+                                if order_status in ('complete', 'traded', 'filled'):
+                                    return {
+                                        "status": "success", 
+                                        "order_id": o.get('order_id'), 
+                                        "order_status": order_status, 
+                                        "filled_quantity": int(o.get('filled_quantity', 0))
+                                    }
+                                elif order_status in ('rejected', 'cancelled'):
+                                    return {
+                                        "status": "rejected",
+                                        "order_id": o.get('order_id'),
+                                        "order_status": order_status,
+                                        "reason": o.get('status_message', 'Rejected by broker')
+                                    }
+                                else:
+                                    # It might be open/pending
+                                    return {
+                                        "status": "pending",
+                                        "order_id": o.get('order_id'),
+                                        "order_status": order_status
+                                    }
                         except Exception as e:
                             logger.error(f"Error parsing order timestamp {ts_str}: {e}")
         except Exception as e:
-            logger.error(f"Error in verify_order_by_details: {e}")
-        return {"status": "not_found"}
+            logger.error(f"Error fetching order book for verification: {e}")
+        return {"status": "error", "reason": "Matching order not found in book"}
 
     def place_order_with_retry(self, symbol: str, side: str, qty: int, order_type: str = 'MARKET', price: float = 0.0, max_retries: int = 1) -> dict:
         """Place order with retry logic and ghost position protection (Bug Fix 1 & 2)."""
