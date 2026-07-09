@@ -1108,13 +1108,18 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
             return
             
         if res.get('status') == 'rejected':
-            logger.warning(f"[USER {user_id}] Broker REJECTED order for {symbol}. Falling back to Hybrid Virtual Trading.")
-            send_alert(user_id, f"⚠️ Broker rejected {side} order for {symbol} (likely margin limit). Continuing trade VIRTUALLY.")
-            is_virtual = True
-            import uuid
-            order_id = f"virtual_{symbol}_{side}_{str(uuid.uuid4())[:6]}"
-            filled_qty = quantity
-            actual_entry = entry_price
+            user_config = bot.config
+            if user_config.get('HYBRID_VIRTUAL_MODE', True):
+                logger.warning(f"[USER {user_id}] Broker REJECTED order for {symbol}. Falling back to Hybrid Virtual Trading.")
+                send_alert(user_id, f"⚠️ Broker rejected {side} order for {symbol} (likely margin limit). Continuing trade VIRTUALLY.")
+                is_virtual = True
+                import uuid
+                order_id = f"virtual_{symbol}_{side}_{str(uuid.uuid4())[:6]}"
+                filled_qty = quantity
+                actual_entry = entry_price
+            else:
+                send_alert(user_id, f"Entry order REJECTED by broker for {symbol} ({side}). Aborting trade.")
+                return
         elif res.get('status') != 'success':
             send_alert(user_id, f"Entry order placement failed for {symbol} ({side}).")
             return
@@ -1132,18 +1137,21 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     # Step 6 — Place SL order
     sl_order_id = None
     if not is_paper:
-        if is_virtual:
-            import uuid
-            sl_order_id = f"virtual_sl_{symbol}_{str(uuid.uuid4())[:6]}"
-        else:
-            sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
-            if sl_res.get('status') != 'success':
+        # User requested: Force the SL order onto the Upstox API even for virtual trades so they appear in logs.
+        sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
+        if sl_res.get('status') != 'success':
+            if is_virtual:
+                # If virtual, we EXPECT Upstox to reject it because we have no position. Ignore rejection.
+                import uuid
+                sl_order_id = sl_res.get('order_id') or f"virtual_sl_{symbol}_{str(uuid.uuid4())[:6]}"
+            else:
                 send_alert(user_id, f"SL order placement failed for {symbol}. Emergency square-off!")
                 counter_side = "SELL" if side == "BUY" else "BUY"
                 exit_res = bot.engine.place_order_with_retry(symbol_key, counter_side, filled_qty)
                 if exit_res.get('status') != 'success':
                     send_alert(user_id, f"FATAL: Emergency square-off failed for {symbol}! Manual intervention required!")
                 return
+        else:
             sl_order_id = sl_res.get('order_id')
  
     # Step 7 — Persist to database
@@ -1892,6 +1900,7 @@ async def api_update_config(payload: dict, user: dict = Depends(require_auth), d
     if "MAX_STOCK_PRICE" in payload: cfg.max_stock_price = float(payload["MAX_STOCK_PRICE"])
     if "USE_GROQ_FILTER" in payload: cfg.use_groq_filter = 1 if payload["USE_GROQ_FILTER"] else 0
     if "USE_LIVE_CAPITAL" in payload: cfg.use_live_capital = 1 if payload["USE_LIVE_CAPITAL"] else 0
+    if "HYBRID_VIRTUAL_MODE" in payload: cfg.hybrid_virtual_mode = 1 if payload["HYBRID_VIRTUAL_MODE"] else 0
     if "MANUAL_CAPITAL" in payload: cfg.manual_capital = float(payload["MANUAL_CAPITAL"])
     if "MODE" in payload: cfg.trading_mode = payload["MODE"].upper()
     
@@ -1958,6 +1967,7 @@ def get_user_config_dict(db, user_id: int) -> dict:
         "MAX_STOCK_PRICE": cfg.max_stock_price,
         "USE_GROQ_FILTER": bool(cfg.use_groq_filter),
         "USE_LIVE_CAPITAL": bool(cfg.use_live_capital),
+        "HYBRID_VIRTUAL_MODE": getattr(cfg, 'hybrid_virtual_mode', 1) == 1,
         "MANUAL_CAPITAL": cfg.manual_capital,
         "MODE": cfg.trading_mode or "TEST"
     }

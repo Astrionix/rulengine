@@ -3941,6 +3941,13 @@
                             <option value="false">DISABLED</option>
                         </select>
                     </div>
+                    <div class="cfg-row">
+                        <span class="cfg-label">Hybrid Virtual Mode<br><small style="color:var(--muted);font-size:10px;font-weight:400;">(Simulate rejected orders)</small></span>
+                        <select class="cfg-input" id="c-hybrid-mode">
+                            <option value="true">ENABLED</option>
+                            <option value="false">DISABLED</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="cfg-section">
                     <div class="cfg-sec-title">💰 Capital Management</div>
@@ -4398,6 +4405,7 @@
                                     background:${isBuy ? 'rgba(0,230,118,.1)' : 'rgba(255,59,59,.1)'};
                                     border:1px solid ${isBuy ? 'rgba(0,230,118,.2)' : 'rgba(255,59,59,.2)'}">${t0.side}</span>
                                 <span style="font-size:10px;font-weight:700;color:var(--muted);background:var(--badge-bg);padding:1px 6px;border-radius:3px;font-family:'JetBrains Mono';">${t0.qty}</span>
+                                <span style="font-size:13px;font-weight:800;color:var(--text);font-family:'JetBrains Mono';background:var(--bg-panel-hover);padding:2px 8px;border-radius:4px;" id="active-p-${t0.symbol}">₹${(window._latestPrices && window._latestPrices[t0.symbol] ? window._latestPrices[t0.symbol] : t0.entry_price).toFixed(2)}</span>
                             </div>`;
 
                         exitBtnEl.innerHTML = `
@@ -4475,6 +4483,7 @@
             try {
                 const res = await fetch(`${API}/live-prices`);
                 const prices = await res.json();
+                window._latestPrices = prices;
 
                 // Update scanner price tickers
                 for (const sym in prices) {
@@ -4485,6 +4494,15 @@
                         el.setAttribute('data-prev', prices[sym]);
                         if (prices[sym] > prev) { el.style.color = 'var(--green)'; el.style.textShadow = '0 0 10px rgba(0,230,118,0.5)'; setTimeout(() => { el.style.color = ''; el.style.textShadow = ''; }, 400); }
                         else if (prices[sym] < prev) { el.style.color = 'var(--red)'; el.style.textShadow = '0 0 10px rgba(255,59,59,0.5)'; setTimeout(() => { el.style.color = ''; el.style.textShadow = ''; }, 400); }
+                    }
+                    
+                    const activeP = document.getElementById(`active-p-${sym}`);
+                    if (activeP) {
+                        const prev = parseFloat(activeP.getAttribute('data-prev') || prices[sym]);
+                        activeP.textContent = `₹${prices[sym].toFixed(2)}`;
+                        activeP.setAttribute('data-prev', prices[sym]);
+                        if (prices[sym] > prev) { activeP.style.color = 'var(--green)'; }
+                        else if (prices[sym] < prev) { activeP.style.color = 'var(--red)'; }
                     }
                 }
             } catch (e) { }
@@ -5224,6 +5242,7 @@
             document.getElementById('c-min-price').value = config.MIN_STOCK_PRICE || 50;
             document.getElementById('c-max-price').value = config.MAX_STOCK_PRICE || 5000;
             document.getElementById('c-ai').value = config.USE_GROQ_FILTER ? 'true' : 'false';
+            document.getElementById('c-hybrid-mode').value = config.HYBRID_VIRTUAL_MODE !== false ? 'true' : 'false';
             document.getElementById('c-mode').value = config.MODE || 'TEST';
             document.getElementById('c-use-live-capital').value = config.USE_LIVE_CAPITAL ? 'true' : 'false';
             document.getElementById('c-manual-cap').value = config.MANUAL_CAPITAL || 10000.0;
@@ -5278,6 +5297,7 @@
                 MIN_STOCK_PRICE: parseFloat(document.getElementById('c-min-price').value),
                 MAX_STOCK_PRICE: parseFloat(document.getElementById('c-max-price').value),
                 USE_GROQ_FILTER: document.getElementById('c-ai').value === 'true',
+                HYBRID_VIRTUAL_MODE: document.getElementById('c-hybrid-mode').value === 'true',
                 MODE: document.getElementById('c-mode').value,
                 USE_LIVE_CAPITAL: document.getElementById('c-use-live-capital').value === 'true',
                 MANUAL_CAPITAL: parseFloat(document.getElementById('c-manual-cap').value)

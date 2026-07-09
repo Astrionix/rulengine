@@ -283,22 +283,7 @@ class TradeManager:
 
         # If a physically new SL triggers, process it on the server
         if abs(rounded_new_sl - rounded_current_sl) >= 0.05:
-            if str(sl_order_id).startswith("virtual_"):
-                trade['sl'] = rounded_new_sl
-                logger.info(f"VIRTUAL Trailing SL updated for {trade['symbol']} to {rounded_new_sl}")
-                
-                # Update DB
-                db = SessionLocal()
-                try:
-                    db_trade = db.query(Trade).filter(Trade.id == trade['id']).first()
-                    if db_trade:
-                        db_trade.sl_price = rounded_new_sl
-                        db.commit()
-                except Exception as e:
-                    logger.error(f"Failed to update virtual SL in DB: {e}")
-                finally:
-                    db.close()
-            elif execution_engine:
+            if execution_engine:
                 symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
                 
                 # 1. Cancel existing SL order
@@ -308,34 +293,38 @@ class TradeManager:
                 
                 # 2. Place new SL order
                 place_res = execution_engine.place_stop_loss(symbol_key, side, qty, rounded_new_sl)
-                if place_res.get('status') == 'success':
+                
+                # For virtual trades, we expect this to be rejected. We just update it internally anyway.
+                if place_res.get('status') == 'success' or str(sl_order_id).startswith("virtual_"):
                     new_sl_order_id = place_res.get('order_id')
+                    if not new_sl_order_id and str(sl_order_id).startswith("virtual_"):
+                        new_sl_order_id = f"virtual_sl_{trade['symbol']}_{str(uuid.uuid4())[:6]}"
+                        
                     trade['sl_order_id'] = new_sl_order_id
                     trade['sl'] = rounded_new_sl
                     
-                    trade_logger.info(f"TRAILED PHYSICAL SL (2-Stage): {trade['symbol']} | Old: {rounded_current_sl} | New: {rounded_new_sl} | New SL Order ID: {new_sl_order_id}")
-                    
-                    # 3. Save new sl_price and sl_order_id to DB (Bug Fix 3)
+                    # Update DB
                     db = SessionLocal()
                     try:
-                        db_trade = db.query(Trade).filter(Trade.id == trade['id'], Trade.user_id == self.user_id).first()
+                        db_trade = db.query(Trade).filter(Trade.id == trade['id']).first()
                         if db_trade:
-                            db_trade.sl_price = float(rounded_new_sl)
+                            db_trade.sl_price = rounded_new_sl
                             db_trade.sl_order_id = new_sl_order_id
                             db.commit()
-                            
-                            # Dispatch Telegram Alert
-                            try:
-                                from telegram_alert import alert_trailing_sl_updated
-                                stage = "BREAKEVEN" if rounded_new_sl == entry else "TRAILING"
-                                alert_trailing_sl_updated(trade['symbol'], stage, rounded_current_sl, rounded_new_sl, price)
-                            except Exception as ta_err:
-                                logger.error(f"Failed to send trailing SL alert: {ta_err}")
                     except Exception as e:
-                        db.rollback()
-                        logger.error(f"Failed to update trailed SL in DB: {e}")
+                        logger.error(f"Failed to update SL in DB: {e}")
                     finally:
                         db.close()
+                        
+                    logger.info(f"Trailing SL updated successfully on server for {trade['symbol']} to {rounded_new_sl}")
+                    
+                    # Dispatch alert
+                    try:
+                        from telegram_alert import alert_trailing_sl_updated
+                        stage = "BREAKEVEN" if rounded_new_sl == entry else "TRAILING"
+                        alert_trailing_sl_updated(trade['symbol'], stage, rounded_current_sl, rounded_new_sl, price)
+                    except Exception as ta_err:
+                        logger.error(f"Failed to send trailing SL alert: {ta_err}")
                 else:
                     logger.error(f"Failed to place new trailed SL for {trade['symbol']}")
             else:
@@ -354,14 +343,25 @@ class TradeManager:
         trade['exit_reason'] = reason
         trade['exit_time'] = get_ist_now().isoformat()
         
-        # Cancel stop loss order on the broker side if execution_engine and sl_order_id are available
         sl_order_id = trade.get('sl_order_id')
-        if sl_order_id and execution_engine and not str(sl_order_id).startswith("virtual_"):
-            try:
-                logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
-                execution_engine.cancel_order(sl_order_id)
-            except Exception as e:
-                logger.error(f"Failed to cancel SL order {sl_order_id}: {e}")
+        if execution_engine:
+            # 1. Cancel pending SL order on Upstox
+            if sl_order_id:
+                try:
+                    logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
+                    execution_engine.cancel_order(sl_order_id)
+                except Exception as e:
+                    logger.error(f"Failed to cancel SL order {sl_order_id}: {e}")
+                    
+            # 2. Place actual market exit order so it logs in Upstox (even if rejected)
+            symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+            if symbol_key:
+                counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
+                logger.info(f"Submitting square-off order to Upstox for {trade['symbol']} ({reason})")
+                try:
+                    execution_engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
+                except Exception as e:
+                    logger.error(f"Failed to place exit order on broker: {e}")
         
         # Consecutive Losses Tracking (Now isolated by TradeManager instance)
         if not hasattr(self, 'consecutive_losses'):

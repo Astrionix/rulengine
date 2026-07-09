@@ -105,6 +105,7 @@ class UserConfig(Base):
     use_groq_filter        = Column(Integer, default=1)  # 1=True, 0=False
     use_live_capital       = Column(Integer, default=0)
     manual_capital         = Column(Float, default=10000.0)
+    hybrid_virtual_mode    = Column(Integer, default=1)  # 1=True, 0=False
     trading_mode           = Column(String(20), default="TEST")  # "TEST" or "LIVE"
     is_running             = Column(Integer, default=0)          # 1=Running, 0=Stopped
     updated_at             = Column(DateTime, default=get_ist_now, onupdate=get_ist_now)
