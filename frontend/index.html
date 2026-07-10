@@ -1636,6 +1636,8 @@
                 radial-gradient(ellipse at 80% 70%, rgba(139, 92, 246, 0.07) 0%, transparent 50%);
             flex-direction: column;
             overflow: hidden;
+            height: 100vh;
+            max-height: 100vh;
             animation: hist-in 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
@@ -4788,12 +4790,14 @@
             if (histScreenOpen) {
                 screen.classList.add('open');
                 if (tabBtn) tabBtn.classList.add('active');
+                document.body.style.overflow = 'hidden';
                 // Show yesterday by default (most relevant for reviewing past trades)
                 // Fetch fresh data first, then render
                 fetchHistoryAndRender('yesterday');
             } else {
                 screen.classList.remove('open');
                 if (tabBtn) tabBtn.classList.remove('active');
+                document.body.style.overflow = '';
             }
         }
 
