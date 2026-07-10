@@ -188,6 +188,7 @@ class SignalScanner:
             rsi_14 = float(latest.get('rsi_14', 50.0))
             ema_9 = float(latest.get('ema_9', close))
             ema_21 = float(latest.get('ema_21', close))
+            ema_20 = float(latest.get('ema_20', close))
 
             # Volume ratio (6-bar)
             vol_ma_6 = df['volume'].iloc[-7:-1].mean() if len(df) >= 7 else df['volume'].mean()

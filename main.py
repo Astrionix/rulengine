@@ -1227,11 +1227,16 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
             add_to_daily_blacklist(user_id, symbol)
             return
             
-        if res.get('status') == 'rejected':
+        # Check if the order was rejected synchronously or filled_qty is 0 (asynchronous rejection/insufficient funds)
+        is_rejected_sync = res.get('status') == 'rejected'
+        is_rejected_async = (res.get('status') == 'success' and res.get('filled_quantity', 0) <= 0)
+        
+        if is_rejected_sync or is_rejected_async:
             user_config = bot.config
             if user_config.get('HYBRID_VIRTUAL_MODE', True):
-                logger.warning(f"[USER {user_id}] Broker REJECTED order for {symbol}. Falling back to Hybrid Virtual Trading.")
-                send_alert(user_id, f"⚠️ Broker rejected {side} order for {symbol} (likely margin limit). Continuing trade VIRTUALLY.")
+                reject_reason = res.get('reason', 'Exchange Rejected') if is_rejected_sync else 'Insufficient Margin/Exchange Rejected'
+                logger.warning(f"[USER {user_id}] Broker/Exchange REJECTED order for {symbol} ({reject_reason}). Falling back to Hybrid Virtual Trading.")
+                send_alert(user_id, f"⚠️ Broker rejected {side} order for {symbol} ({reject_reason}). Continuing trade VIRTUALLY.")
                 is_virtual = True
                 import uuid
                 order_id = f"virtual_{symbol}_{side}_{str(uuid.uuid4())[:6]}"
@@ -1247,7 +1252,7 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
             order_id = res.get('order_id')
             filled_qty = res.get('filled_quantity', quantity)
             actual_entry = res.get('average_price', entry_price) or entry_price
- 
+
         # Bug Fix 2: Check filled quantity
         if filled_qty <= 0:
             logger.error(f"[USER {user_id}] Filled quantity is 0 for {symbol}. Aborting SL placement.")

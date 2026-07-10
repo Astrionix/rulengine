@@ -405,8 +405,8 @@ class TradeManager:
                 bot.state.status = "STOPPED"
                 bot.state.trading_halted = True
                 logger.warning(f"[USER {self.user_id}] Session P&L {session_pnl} hit drawdown limit {daily_drawdown_limit}. Halting.")
-                from telegram_alert import alert_telegram
-                alert_telegram(f"🚨 Daily drawdown limit hit (P&L: {session_pnl:.2f}) — trading paused for the day.")
+                from telegram_alert import send_telegram
+                send_telegram(f"🚨 Daily drawdown limit hit (P&L: {session_pnl:.2f}) — trading paused for the day.")
             
         logger.info(f"Trade closed: {trade['id']}, Reason: {reason}, PnL: {trade['pnl']}, Consecutive Losses: {self.consecutive_losses}")
         trade_logger.info(f"CLOSED TRADE: [id={trade['id']}, symbol={trade['symbol']}, reason={reason}, final_pnl={trade['pnl']}, exit_price={trade['current_price']}]")

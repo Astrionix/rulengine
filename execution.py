@@ -394,7 +394,10 @@ class UpstoxExecutionEngine:
                     }
                 else:
                     logger.error(f"Upstox Order Rejected: {response_data}")
-                    retries += 1
+                    return {
+                        "status": "rejected",
+                        "reason": response_data.get('errors', [{}])[0].get('message', 'Rejected') if response_data.get('errors') else 'Rejected'
+                    }
                     
             except Exception as e:
                 logger.error(f"API Crash/Timeout during order placement: {str(e)}")
