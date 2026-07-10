@@ -5128,7 +5128,10 @@
                     const pnlStr = t._entry > 0 ? `${isWin ? '+' : ''}₹${t._pnl.toFixed(2)}` : '--';
                     return `
                     <tr>
-                        <td><span class="h-sym">${t.symbol}</span></td>
+                        <td>
+                            <span class="h-sym">${t.symbol}</span>
+                            <div style="font-size:10px; color:var(--muted); font-weight:700; margin-top:2px;">Score: ${t.score ? t.score + '/5' : '--'}</div>
+                        </td>
                         <td class="${t.side === 'BUY' ? 'h-side-buy' : 'h-side-sell'}">${t.side}</td>
                         <td style="font-family:'JetBrains Mono'; font-weight:700;">${t._qty}</td>
                         <td>${fmtISTTime(t._entryTs)}</td>

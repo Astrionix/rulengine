@@ -1778,6 +1778,7 @@ def api_get_all_history(
             'entry_price': t.entry_price, 'exit_price': t.exit_price,
             'sl': t.sl_price, 'pnl': t.realized_pnl or 0.0,
             'exit_reason': t.exit_reason,
+            'score': t.ai_score or 0,
             'status': t.status if t.status == 'OPEN' else (
                 'Win' if (t.realized_pnl or 0) > 0 else 'Loss' if (t.realized_pnl or 0) < 0 else 'Breakeven'
             )
