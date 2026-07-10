@@ -4590,7 +4590,7 @@
 
                 // Deduplicate by trade ID (DB is source of truth)
                 const seen = new Set();
-                tradeHistory = history.filter(t => {
+                const sessionTrades = history.filter(t => {
                     if (seen.has(t.id)) return false;
                     seen.add(t.id);
                     return true;
@@ -4598,13 +4598,12 @@
 
                 const tbody = document.getElementById('history-tbody');
 
-                if (tradeHistory.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="empty">No closed trades found in history.</td></tr>';
-                    if (histScreenOpen) renderHistoryScreen();
+                if (sessionTrades.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="empty">No closed trades found in history.</td></tr>';
                     return;
                 }
 
-                tbody.innerHTML = tradeHistory.slice(0, 50).map(t => {
+                tbody.innerHTML = sessionTrades.slice(0, 50).map(t => {
                     const status = t.status || 'CLOSED';
                     const pnl = parseFloat(t.pnl || t.realized_pnl || 0);
                     const entry = parseFloat(t.entry_price || 0);
@@ -4641,11 +4640,8 @@
                 }).join('');
 
                 // Update win rate
-                const wins = tradeHistory.filter(t => parseFloat(t.pnl || 0) > 0).length;
-                document.getElementById('r-winrate').textContent = tradeHistory.length > 0 ? `${Math.round((wins / tradeHistory.length) * 100)}%` : '0%';
-
-                // Refresh history screen if open
-                if (histScreenOpen) renderHistoryScreen();
+                const wins = sessionTrades.filter(t => parseFloat(t.pnl || 0) > 0).length;
+                document.getElementById('r-winrate').textContent = sessionTrades.length > 0 ? `${Math.round((wins / sessionTrades.length) * 100)}%` : '0%';
 
             } catch (e) { console.error('fetchHistory error:', e); }
         }
