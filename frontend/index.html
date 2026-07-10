@@ -5152,8 +5152,11 @@
                         </div>
                         ${isToday ? '<span class="hday-today-badge">TODAY</span>' : ''}
                     </div>
-                    <div class="hday-stats-row">
-                        <div style="display: flex; align-items: center; justify-content: flex-end; margin-right: 8px;">
+                    <div class="hday-stats-row" style="display: flex; align-items: center; gap: 16px;">
+                        <div style="font-size: 13px; font-weight: 800; font-family: 'JetBrains Mono'; color: #ffffff;">
+                            ${dayTrades.length}
+                        </div>
+                        <div style="display: flex; align-items: center;">
                             <span style="font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">Winrate - <span style="font-size: 13px; font-weight: 800; font-family: 'JetBrains Mono'; color: ${wrColor};">${dayWr}%</span></span>
                         </div>
                         <div class="hday-pnl-badge ${pnlClass}">${dayPnl >= 0 ? '+' : ''}₹${Math.abs(dayPnl).toFixed(2)}</div>
