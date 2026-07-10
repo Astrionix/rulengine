@@ -1669,7 +1669,32 @@ def api_get_live_prices(user: dict = Depends(require_auth)):
 def api_get_active_trades(user: dict = Depends(require_auth)):
     uid = user["uid"]
     bot = get_bot(uid)
-    return bot.tm.active_trades if bot else []
+    if not bot:
+        return []
+    
+    # Dynamically update prices from shared live prices cache for fast frontend updates
+    trades = []
+    for t in bot.tm.active_trades:
+        trade_copy = dict(t)
+        symbol = t["symbol"]
+        ltp = _shared_prices.get(symbol, t.get("current_price", t["entry_price"]))
+        if ltp == t.get("current_price", t["entry_price"]):
+            sym_key = Config.SYMBOLS_MAPPING.get(symbol)
+            if sym_key and sym_key in _shared_prices:
+                ltp = _shared_prices[sym_key]
+        
+        trade_copy["current_price"] = round(ltp, 2)
+        qty = t["qty"]
+        entry = t["entry_price"]
+        side = t["side"]
+        if side == "BUY":
+            pnl = (ltp - entry) * qty
+        else:
+            pnl = (entry - ltp) * qty
+        trade_copy["pnl"] = round(pnl, 2)
+        trades.append(trade_copy)
+        
+    return trades
 
 @app.get("/api/trades/history")
 def api_get_trade_history(user: dict = Depends(require_auth)):
@@ -1921,10 +1946,37 @@ def api_get_status(user: dict = Depends(require_auth)):
     bot.state.usable_balance = manual_cap
     bot.state.active_capital = manual_cap
 
+    # Calculate live daily pnl and dynamic active trades for fast frontend updates
+    dynamic_trades = []
+    active_pnl = 0.0
+    for t in bot.tm.active_trades:
+        trade_copy = dict(t)
+        symbol = t["symbol"]
+        ltp = _shared_prices.get(symbol, t.get("current_price", t["entry_price"]))
+        if ltp == t.get("current_price", t["entry_price"]):
+            sym_key = Config.SYMBOLS_MAPPING.get(symbol)
+            if sym_key and sym_key in _shared_prices:
+                ltp = _shared_prices[sym_key]
+        
+        trade_copy["current_price"] = round(ltp, 2)
+        qty = t["qty"]
+        entry = t["entry_price"]
+        side = t["side"]
+        if side == "BUY":
+            pnl = (ltp - entry) * qty
+        else:
+            pnl = (entry - ltp) * qty
+        trade_copy["pnl"] = round(pnl, 2)
+        active_pnl += pnl
+        dynamic_trades.append(trade_copy)
+        
+    history_pnl = sum([t['pnl'] for t in bot.tm.trade_history if t['timestamp'][:10] == get_ist_now().isoformat()[:10]])
+    live_daily_pnl = round(history_pnl + active_pnl, 2)
+
     return {
         "is_running":         bot.state.is_running,
         "kill_switch_active": bot.state.kill_switch_active,
-        "daily_pnl":          bot.state.daily_pnl,
+        "daily_pnl":          live_daily_pnl,
         "trades_taken":       bot.state.trades_taken,
         "max_trades":         Config.MAX_TRADES_PER_DAY,
         "market_condition":   bot.state.market_condition,
@@ -1933,7 +1985,7 @@ def api_get_status(user: dict = Depends(require_auth)):
         "usable_balance":     bot.state.usable_balance,
         "indices":            _shared_state.live_indices,
         "indices_prev_close": _shared_state.index_prev_close,
-        "active_trades":      bot.tm.active_trades,
+        "active_trades":      dynamic_trades,
         "mode":               bot.config.get("MODE", "TEST"),
         "credentials_set":    bool(bot.creds.get("upstox_access_token")),
         "upstox_updated_at":  bot.creds.get("updated_at"),
