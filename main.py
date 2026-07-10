@@ -1839,7 +1839,17 @@ def api_get_strategy_performance(user: dict = Depends(require_auth), db=Depends(
             return {"win_rate": 0, "avg_rr": 0.0, "trades": 0}
         wins = sum(1 for t in trade_list if (t.realized_pnl or 0.0) > 0)
         win_rate = round((wins / total) * 100, 1)
-        rr_vals = [t.rr_ratio for t in trade_list if t.rr_ratio is not None and t.rr_ratio > 0]
+        
+        rr_vals = []
+        for t in trade_list:
+            val = t.rr_ratio
+            if val is None or val <= 0:
+                risk_val = abs(t.entry_price - t.sl_price) if t.sl_price else 0
+                reward_val = abs(t.target_price - t.entry_price) if t.target_price else 0
+                val = round(reward_val / risk_val, 2) if risk_val > 0 else 0.0
+            if val > 0:
+                rr_vals.append(val)
+                
         avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
         return {"win_rate": win_rate, "avg_rr": avg_rr, "trades": total}
 
