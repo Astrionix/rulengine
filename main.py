@@ -1752,7 +1752,7 @@ def api_get_trade_history(user: dict = Depends(require_auth), db=Depends(get_db)
             'sl_order_id': t.sl_order_id
         })
         
-    return sorted(result, key=lambda x: x['timestamp'], reverse=True)
+    return sorted(result, key=lambda x: x['timestamp'])
 
 @app.get("/api/trades/all-history")
 def api_get_all_history(
@@ -1767,7 +1767,7 @@ def api_get_all_history(
         query = query.filter(Trade.trade_date >= start_date)
     if end_date:
         query = query.filter(Trade.trade_date <= end_date)
-    trades = query.order_by(desc(Trade.entry_time)).all()
+    trades = query.order_by(Trade.entry_time).all()
     result = []
     for t in trades:
         result.append({
