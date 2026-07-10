@@ -34,7 +34,7 @@ from database import (
     SessionLocal, Trade, get_db,
     get_global_trading_enabled, set_global_trading_enabled,
     is_symbol_blacklisted, add_to_daily_blacklist, get_daily_blacklist,
-    get_trades_count_today
+    get_trades_count_today, get_ist_now
 )
 from sqlalchemy import desc
 from dual_strategy_engine import DualStrategyEngine

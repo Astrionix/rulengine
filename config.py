@@ -81,7 +81,7 @@ class Config:
     MIN_STOCK_PRICE = 50.0
     MAX_STOCK_PRICE = 5000.0
 
-    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() == "true"
+    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "false").lower() == "true"
 
     # ── v2 Pipeline & Risk Controls (Section 6) ──────────────────────────────
     MAX_CONSECUTIVE_LOSSES   = 2       # stops new entries after 2 consecutive losses
@@ -109,7 +109,7 @@ class Config:
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # ── Paper Trading Mode ────────────────────────────────────────────────────
-    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() == "true"
+    PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "false").lower() == "true"
 
     # Symbols mapping (User friendly name -> Upstox Format)
 
