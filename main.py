@@ -1702,12 +1702,57 @@ def api_get_active_trades(user: dict = Depends(require_auth)):
     return trades
 
 @app.get("/api/trades/history")
-def api_get_trade_history(user: dict = Depends(require_auth)):
+def api_get_trade_history(user: dict = Depends(require_auth), db=Depends(get_db)):
     uid = user["uid"]
-    bot = get_bot(uid)
-    if not bot:
+    
+    # Get all unique trade dates for user, sorted descending
+    all_trade_dates = db.query(Trade.trade_date).filter(Trade.user_id == uid).distinct().order_by(Trade.trade_date.desc()).all()
+    trade_dates = [d[0] for d in all_trade_dates if d[0] is not None]
+    
+    if not trade_dates:
         return []
-    return sorted(bot.tm.trade_history, key=lambda x: x['timestamp'], reverse=True)
+        
+    latest_trade_date = trade_dates[0]
+    
+    # Determine if we have crossed 9:00 AM on a new weekday trading day.
+    # If yes, we reset (show today's empty history). Otherwise, show latest day's history.
+    now = get_ist_now()
+    today = now.date()
+    is_weekday = now.weekday() < 5 # Mon-Fri
+    
+    show_today_empty = False
+    if is_weekday and now.time() >= time(9, 0):
+        if today > latest_trade_date:
+            show_today_empty = True
+            
+    if show_today_empty:
+        db_trades = db.query(Trade).filter(Trade.user_id == uid, Trade.trade_date == today).all()
+    else:
+        db_trades = db.query(Trade).filter(Trade.user_id == uid, Trade.trade_date == latest_trade_date).all()
+        
+    result = []
+    for t in db_trades:
+        result.append({
+            'id': t.id,
+            'timestamp': t.entry_time.isoformat() if t.entry_time else now.isoformat(),
+            'symbol': t.symbol,
+            'side': t.side,
+            'entry_price': t.entry_price,
+            'exit_price': t.exit_price or 0.0,
+            'current_price': t.exit_price or t.entry_price,
+            'qty': t.quantity,
+            'sl': t.sl_price,
+            'initial_sl': t.sl_price,
+            'probability': 0.0,
+            'score': t.ai_score or 0.0,
+            'pnl': t.realized_pnl or 0.0,
+            'status': t.status,
+            'exit_reason': t.exit_reason,
+            'exit_time': t.exit_time.isoformat() if t.exit_time else None,
+            'sl_order_id': t.sl_order_id
+        })
+        
+    return sorted(result, key=lambda x: x['timestamp'], reverse=True)
 
 @app.get("/api/trades/all-history")
 def api_get_all_history(

@@ -4585,7 +4585,7 @@
         // ─── HISTORY (main dashboard table + win rate) ───────────────────────────
         async function fetchHistory() {
             try {
-                const res = await fetch(`${API}/trades/all-history`);
+                const res = await fetch(`${API}/trades/history`);
                 const history = await res.json();
 
                 // Deduplicate by trade ID (DB is source of truth)
