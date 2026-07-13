@@ -34,6 +34,7 @@ class FeatureExtractor:
         
         # Rolling candle cache: {instrument_key: {"df": DataFrame, "last_refresh": timestamp}}
         self._candle_cache = {}
+        self._daily_cache = {}
         
         # Market context cache
         self._nifty_trend = {"trend": "sideways", "change_pct": 0.0, "last_refresh": 0}
@@ -42,7 +43,7 @@ class FeatureExtractor:
         self._sector_perf = {}  # {sector: pct_vs_nifty, "last_refresh": 0}
         self._sector_refresh_time = 0
 
-    def extract(self, signals: list, prices_cache: dict, indices_cache: dict, market_regime: str = "UNKNOWN") -> list:
+    def extract(self, signals: list, prices_cache: dict, indices_cache: dict, market_regime: str = "UNKNOWN", prev_close_cache: dict = None) -> list:
         """
         Extract features for each qualifying stock from Layer 3.
         
@@ -50,6 +51,7 @@ class FeatureExtractor:
             signals: List of signal dicts from Layer 3
             prices_cache: Live price cache
             indices_cache: Live index cache
+            prev_close_cache: Cache containing previous day closes for indices
             
         Returns:
             JSON-ready list of feature payloads for Claude.
@@ -58,7 +60,7 @@ class FeatureExtractor:
             return []
 
         # Refresh market context caches
-        self._refresh_market_context(indices_cache)
+        self._refresh_market_context(indices_cache, prev_close_cache)
 
         payloads = []
         for signal in signals:
@@ -98,7 +100,7 @@ class FeatureExtractor:
         atr_pct = (atr_14 / ltp * 100) if ltp > 0 else 0
 
         # Get daily EMA20 for price_vs_ema20_daily
-        daily_df = self.engine.get_historical_candles_daily(instrument_key, days=45)
+        daily_df = self._get_cached_daily_candles(instrument_key, days=45)
         price_vs_ema20_daily = 0.0
         rsi_14_daily = 50.0
         if not daily_df.empty and len(daily_df) >= 20:
@@ -180,11 +182,10 @@ class FeatureExtractor:
                 price_trending_down = prices[-1] < prices[0]
                 volume_trending_down = last_4_volumes[-1] < last_4_volumes[0]
                 volume_trending_up = last_4_volumes[-1] > last_4_volumes[0]
-                
                 direction = signal["direction"]
                 if direction == "LONG" and price_trending_up and volume_trending_down:
                     volume_divergence = True
-                elif direction == "SHORT" and price_trending_down and volume_trending_up:
+                elif direction == "SHORT" and price_trending_down and volume_trending_down:
                     volume_divergence = True
 
         # ── Levels ────────────────────────────────────────────────────────
@@ -194,29 +195,68 @@ class FeatureExtractor:
         dist_to_resistance = ((resistance_20bar - ltp) / ltp * 100) if ltp > 0 else 0
         dist_to_support = ((ltp - support_20bar) / ltp * 100) if ltp > 0 else 0
 
-        # ── IMPROVEMENT 2: R:R Pre-filter (minimum 2.0x before Claude) ────
-        # Compute expected risk and reward from structure levels
-        direction = signal["direction"]
-        if direction == "LONG":
-            rr_risk   = abs(ltp - support_20bar)
-            rr_reward = abs(resistance_20bar - ltp)
-        else:  # SHORT
-            rr_risk   = abs(resistance_20bar - ltp)
-            rr_reward = abs(ltp - support_20bar)
+        # ── Target Multiplier (Adaptive) ──────────────────────────────────
+        target_multiplier = 2.0
+        if "TRENDING_UP" in market_regime or "TRENDING_DOWN" in market_regime:
+            target_multiplier = 2.5
+        elif "RANGING" in market_regime or "HIGH_VOLATILITY" in market_regime:
+            target_multiplier = 1.5
 
-        rr_ratio = rr_reward / rr_risk if rr_risk > 0 else 0.0
-        if rr_ratio < 2.0:
-            logger.info(
-                f"[Layer 4] Pre-filter: {signal['symbol']} {direction} skipped — "
-                f"R:R only {rr_ratio:.1f}x (minimum 2.0x required). "
-                f"Support={support_20bar:.2f}, Resistance={resistance_20bar:.2f}, LTP={ltp:.2f}"
-            )
-            return None
+        # ── Target Generation & Pre-filter ────────────────────────────────
+        direction = signal["direction"]
+        calculated_entry = ltp + (ltp * 0.0005) if direction == "LONG" else ltp - (ltp * 0.0005)
+        
+        # Calculate SL (constrained by min 0.3% and max 1.5 ATR)
+        max_sl_dist = 1.5 * atr_14
+        min_sl_dist = calculated_entry * 0.003
+        
+        if direction == "LONG":
+            base_sl = support_20bar - (calculated_entry * 0.001)
+            dist = calculated_entry - base_sl
+            if dist < min_sl_dist:
+                calculated_sl = calculated_entry - atr_14
+            elif dist > max_sl_dist:
+                logger.info(f"[Layer 4] {signal['symbol']} skipped — SL distance ({dist/calculated_entry*100:.2f}%) exceeds 1.5 ATR limit.")
+                return None
+            else:
+                calculated_sl = base_sl
+                
+            risk = calculated_entry - calculated_sl
+            calculated_target = calculated_entry + (target_multiplier * risk)
+            
+            # Target resistance violation check
+            if calculated_target > resistance_20bar:
+                if vol_ratio_6bar > 3.0 and volume_trend == "expanding":
+                    calculated_target = min(calculated_target, resistance_20bar * 1.005)
+                else:
+                    logger.info(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds resistance ({resistance_20bar:.2f}) without volume breakout.")
+                    return None
+                    
+        else:  # SHORT
+            base_sl = resistance_20bar + (calculated_entry * 0.001)
+            dist = base_sl - calculated_entry
+            if dist < min_sl_dist:
+                calculated_sl = calculated_entry + atr_14
+            elif dist > max_sl_dist:
+                logger.info(f"[Layer 4] {signal['symbol']} skipped — SL distance ({dist/calculated_entry*100:.2f}%) exceeds 1.5 ATR limit.")
+                return None
+            else:
+                calculated_sl = base_sl
+                
+            risk = calculated_sl - calculated_entry
+            calculated_target = calculated_entry - (target_multiplier * risk)
+            
+            if calculated_target < support_20bar:
+                if vol_ratio_6bar > 3.0 and volume_trend == "expanding":
+                    calculated_target = max(calculated_target, support_20bar * 0.995)
+                else:
+                    logger.info(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds support ({support_20bar:.2f}) without volume breakdown.")
+                    return None
 
         # ── Market Context ────────────────────────────────────────────────
         sector = get_sector(symbol)
-        sector_change = self._sector_perf.get(sector, 0.0)
         nifty_change = self.get_nifty_change_pct()
+        sector_change = self._sector_perf.get(sector, nifty_change)
         sector_vs_nifty = sector_change - nifty_change
         
         # Stock vs Nifty 5-day relative strength
@@ -254,21 +294,19 @@ class FeatureExtractor:
         else:
             time_bucket = "AFTERNOON"
 
-        # ── Target Multiplier (Adaptive) ──────────────────────────────────
-        target_multiplier = 2.0
-        if "TRENDING_UP" in market_regime or "TRENDING_DOWN" in market_regime:
-            target_multiplier = 2.5
-        elif "RANGING" in market_regime or "HIGH_VOLATILITY" in market_regime:
-            target_multiplier = 1.5
-
         # ── Build payload ─────────────────────────────────────────────────
         return {
             "symbol": symbol,
             "target_multiplier": target_multiplier,
+            "calculated_entry": round(calculated_entry, 2),
+            "calculated_sl": round(calculated_sl, 2),
+            "calculated_target": round(calculated_target, 2),
             "signal_direction": direction,
             "signal_time": signal_time,
             "time_bucket": time_bucket,
             "layer3_conditions_met": signal.get("conditions_met", 0),
+            "discovery_score": signal.get("discovery_score"),
+            "discovery_rank": signal.get("discovery_rank"),
 
             "price_context": {
                 "ltp": round(ltp, 2),
@@ -301,8 +339,8 @@ class FeatureExtractor:
                 "distance_to_support_pct": round(dist_to_support, 2),
                 "previous_day_high": round(prev_day_high, 2) if prev_day_high > 0 else 0.0,
                 "previous_day_low": round(prev_day_low, 2) if prev_day_low > 0 else 0.0,
-                "cleared_previous_day_high": bool(ltp > prev_day_high) if prev_day_high > 0 else False,
-                "cleared_previous_day_low": bool(ltp < prev_day_low) if prev_day_low > 0 else False,
+                "cleared_previous_day_high": bool(ltp > (prev_day_high * 1.001)) if prev_day_high > 0 else False,
+                "cleared_previous_day_low": bool(ltp < (prev_day_low * 0.999)) if prev_day_low > 0 else False,
             },
 
             "market_context": {
@@ -334,14 +372,31 @@ class FeatureExtractor:
             self._candle_cache[instrument_key] = {"df": df, "last_refresh": now}
         return df
 
-    def _refresh_market_context(self, indices_cache: dict):
+    def _get_cached_daily_candles(self, instrument_key: str, days: int = 45) -> pd.DataFrame:
+        """Get daily candles from cache, refreshing every 4 hours."""
+        now = _time.time()
+        cache_entry = self._daily_cache.get(instrument_key)
+        refresh_interval = 4 * 3600  # 4 hours
+        
+        if cache_entry and (now - cache_entry["last_refresh"]) < refresh_interval:
+            return cache_entry["df"]
+            
+        df = self.engine.get_historical_candles_daily(instrument_key, days=days)
+        if not df.empty:
+            self._daily_cache[instrument_key] = {"df": df, "last_refresh": now}
+        return df
+
+    def _refresh_market_context(self, indices_cache: dict, prev_close_cache: dict = None):
         """Refresh Nifty trend, VIX, and sector performance at configured intervals."""
         now = _time.time()
+        prev_close_cache = prev_close_cache or {}
 
         # Nifty trend — refresh every 15 minutes
         if (now - self._nifty_trend.get("last_refresh", 0)) > Config.MARKET_DATA_REFRESH_MIN * 60:
             nifty_ltp = indices_cache.get("NSE_INDEX|Nifty 50", 0)
-            nifty_prev = indices_cache.get("NSE_INDEX|Nifty 50_prev", 0)
+            
+            # Use prev_close_cache first, fallback to indices_cache
+            nifty_prev = prev_close_cache.get("NSE_INDEX|Nifty 50", indices_cache.get("NSE_INDEX|Nifty 50_prev", 0))
             
             # Try to get previous close from a separate cache if available
             from config import SystemState
@@ -360,7 +415,7 @@ class FeatureExtractor:
 
             nifty_5day_pct = 0.0
             try:
-                nifty_df = self.engine.get_historical_candles_daily("NSE_INDEX|Nifty 50", days=10)
+                nifty_df = self._get_cached_daily_candles("NSE_INDEX|Nifty 50", days=10)
                 if not nifty_df.empty and len(nifty_df) >= 6:
                     nifty_5day_pct = ((float(nifty_df.iloc[-1]['close']) - float(nifty_df.iloc[-6]['close'])) 
                                       / float(nifty_df.iloc[-6]['close'])) * 100

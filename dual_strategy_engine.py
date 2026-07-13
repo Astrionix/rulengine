@@ -179,6 +179,22 @@ class DualStrategyEngine:
 
                 elif self.state["status"] == "LEG_A_CLOSED":
                     # Monitor Leg B for profit target or SL hit
+                    
+                    # 1. Check if broker already executed SL
+                    if self.state.get("sl_order_id_B"):
+                        try:
+                            status_res = self.ee.get_order_status(self.state["sl_order_id_B"])
+                            if status_res.get('status') == 'success':
+                                order_status = status_res.get('order_status', '').lower()
+                                if order_status in ('complete', 'traded', 'filled'):
+                                    logger.info("Leg B SL order was executed by broker. Closing strategy.")
+                                    self.state["status"] = "CLOSED"
+                                    self.state["qty_B"] = 0
+                                    self.is_running = False
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Error checking Leg B SL status: {e}")
+
                     self.state["pnl_B"] = (self.state["entry_price_B"] - curr_B) * self.state["qty_B"]
                     
                     pct_profit_B = (self.state["entry_price_B"] - curr_B) / self.state["entry_price_B"]

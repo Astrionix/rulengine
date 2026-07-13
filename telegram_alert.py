@@ -172,3 +172,20 @@ def alert_trailing_sl_updated(symbol: str, stage: str, old_sl: float, new_sl: fl
 
 def alert_orb_range_set(symbol: str, or_high: float, or_low: float, range_pct: float, status: str):
     pass  # User requested to disable this notification
+
+def alert_circuit_limit_hit(symbol: str, side: str, qty: int, sl_price: float, context: str):
+    send_telegram_critical(
+        f"🚨 <b>CIRCUIT LIMIT HIT</b>: {symbol}\n"
+        f"Upstox rejected Stop Loss order during {context}.\n"
+        f"Side: {side} | Qty: {qty} | Attempted SL: ₹{sl_price:.2f}\n"
+        f"⚠️ <b>Position is UNMANAGED. Manual intervention required immediately!</b>"
+    )
+
+def alert_heartbeat(time_str: str, stocks_scanned: int, active_trades: int, daily_pnl: float):
+    send_telegram(
+        f"ℹ️ <b>Heartbeat</b> | {time_str} IST\n"
+        f"• Loop Alive\n"
+        f"• Stocks Scanned: {stocks_scanned}\n"
+        f"• Active Trades: {active_trades}\n"
+        f"• Daily P&L: ₹{daily_pnl:+.2f}"
+    )

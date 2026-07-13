@@ -18,10 +18,9 @@ class UpstoxExecutionEngine:
         """
         self.api_v2  = "https://api.upstox.com/v2"
         self.api_v3  = "https://api.upstox.com/v3"
-        # HFT endpoint for order placement (Place/Modify/Cancel Order V3)
         # Official Upstox docs: https://upstox.com/developer/api-documentation/v3/place-order
-        # Correct URL: https://api-hft.upstox.com/v3/order/place  (V3, not V2!)
-        self.api_hft = "https://api-hft.upstox.com/v3"
+        # Correct URL: https://api-hft.upstox.com/v2/order/place  (V2 is the correct HFT endpoint)
+        self.api_hft = "https://api-hft.upstox.com/v2"
         self._creds = credentials  # per-user credentials dict or None
         self.mode = mode or Config.MODE
 
@@ -458,18 +457,25 @@ class UpstoxExecutionEngine:
 
     def place_stop_loss(self, symbol: str, side: str, qty: int, sl_price: float) -> dict:
         transaction_type = "SELL" if side.upper() == "BUY" else "BUY"
-        logger.info(f"[{self.mode}] Placing Stop Loss ({transaction_type}) at {sl_price} for {symbol}")
-        
         rounded_sl = round(sl_price * 20) / 20.0
         
+        # Calculate limit price with 0.1% / 3-tick (0.15) buffer (Fix A)
+        buffer = max(0.15, rounded_sl * 0.001)
+        if transaction_type == "SELL":
+            limit_price = round((rounded_sl - buffer) * 20) / 20.0
+        else:
+            limit_price = round((rounded_sl + buffer) * 20) / 20.0
+
+        logger.info(f"[{self.mode}] Placing Stop Loss Limit ({transaction_type}) trigger: {rounded_sl}, limit: {limit_price} for {symbol}")
+
         payload = {
             "quantity": qty,
             "product": "I",
             "validity": "DAY",
-            "price": 0,
+            "price": limit_price,
             "tag": "intBotSL",
             "instrument_token": symbol,
-            "order_type": "SL-M",
+            "order_type": "SL",
             "transaction_type": transaction_type,
             "disclosed_quantity": 0,
             "trigger_price": rounded_sl,
@@ -478,7 +484,7 @@ class UpstoxExecutionEngine:
         }
 
         if self.mode == "TEST":
-            logger.info(f"TEST MODE: Simulated SL placement at {rounded_sl}.")
+            logger.info(f"TEST MODE: Simulated SL placement at {rounded_sl} (limit {limit_price}).")
             return {"status": "success", "order_id": f"test_sl_{symbol}_{side}"}
             
         try:
@@ -495,16 +501,48 @@ class UpstoxExecutionEngine:
                 return {"status": "success", "order_id": order_id}
             else:
                 logger.error(f"Upstox SL Order Rejected: {response_data}")
-                return {"status": "error"}
+                reason = "Unknown rejection"
+                errors = response_data.get('errors', [])
+                if errors and isinstance(errors, list) and len(errors) > 0:
+                    reason = errors[0].get('message', 'Rejected')
+                
+                # Check for circuit limit keywords (e.g. price range, price band, circuit, limit)
+                circuit_keywords = ["price range", "price band", "circuit", "daily limit", "trigger price limit", "outside range", "daily price range"]
+                is_circuit = any(kw in reason.lower() for kw in circuit_keywords)
+                
+                if is_circuit:
+                    return {"status": "circuit_limit", "reason": reason}
+                return {"status": "error", "reason": reason}
                 
         except Exception as e:
             logger.error(f"API Crash during SL placement: {str(e)}")
             return {"status": "error", "reason": str(e)}
 
-    def modify_order(self, order_id: str, new_price: float, new_trigger: float, qty: int, order_type: str = "SL-M") -> dict:
+    def modify_order(self, order_id: str, new_price: float, new_trigger: float, qty: int, order_type: str = "SL", transaction_type: str = None) -> dict:
         if self.mode == "TEST":
-            logger.info(f"TEST MODE: Modifying order {order_id}.")
+            logger.info(f"TEST MODE: Modifying order {order_id} to trigger {new_trigger}, price {new_price}.")
             return {"status": "success"}
+
+        # Calculate limit price with 0.1% / 3-tick (0.15) buffer if SL Limit price is 0 (Fix A)
+        if order_type == "SL" and new_price == 0:
+            if not transaction_type:
+                try:
+                    orders = self.get_order_book()
+                    for o in orders:
+                        if o.get('order_id') == order_id:
+                            transaction_type = o.get('transaction_type')
+                            break
+                except Exception as e:
+                    logger.error(f"Failed to lookup order {order_id} for transaction_type: {e}")
+            
+            if not transaction_type:
+                transaction_type = "SELL"  # safety fallback
+                
+            buffer = max(0.15, new_trigger * 0.001)
+            if transaction_type.upper() == "SELL":
+                new_price = round((new_trigger - buffer) * 20) / 20.0
+            else:
+                new_price = round((new_trigger + buffer) * 20) / 20.0
 
         payload = {
             "order_id": order_id,
@@ -526,10 +564,21 @@ class UpstoxExecutionEngine:
                 return {"status": "success"}
             else:
                 logger.error(f"Failed to modify order {order_id}: {response_data}")
-                return {"status": "error"}
+                reason = "Unknown modification failure"
+                errors = response_data.get('errors', [])
+                if errors and isinstance(errors, list) and len(errors) > 0:
+                    reason = errors[0].get('message', 'Rejected')
+                
+                # Check for circuit limit keywords (e.g. price range, price band, circuit, limit)
+                circuit_keywords = ["price range", "price band", "circuit", "daily limit", "trigger price limit", "outside range", "daily price range"]
+                is_circuit = any(kw in reason.lower() for kw in circuit_keywords)
+                
+                if is_circuit:
+                    return {"status": "circuit_limit", "reason": reason}
+                return {"status": "error", "reason": reason}
         except Exception as e:
             logger.error(f"API Crash modifying {order_id}: {e}")
-            return {"status": "error"}
+            return {"status": "error", "reason": str(e)}
 
     def cancel_order(self, order_id: str) -> dict:
         if self.mode == "TEST":
@@ -613,3 +662,90 @@ class UpstoxExecutionEngine:
         except Exception as e:
             logger.error(f"Error fetching trade book: {e}")
         return []
+
+    def get_positions(self) -> list:
+        """Fetch active net positions from Upstox (Fix B)."""
+        if self.mode == "TEST":
+            return []
+        try:
+            url = f"{self.api_v2}/portfolio/net-positions"
+            response = requests.get(url, headers=self._get_headers(), timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', [])
+            else:
+                logger.error(f"Failed to fetch net positions: {response.text}")
+        except Exception as e:
+            logger.error(f"Error fetching net positions: {e}")
+        return []
+
+    def check_intraday_leverage(self, instrument_key: str, price: float, qty: int = 100) -> dict:
+        """
+        Calls /v2/charges/margin to calculate required margin for MIS (product='I')
+        and returns leverage information.
+        """
+        if self.mode == "TEST":
+            # In test mode, assume 5x leverage is supported
+            return {"status": "success", "leverage": 5.0, "intraday_supported": True}
+
+        url = f"{self.api_v2}/charges/margin"
+        payload = {
+            "instruments": [
+                {
+                    "instrument_key": instrument_key,
+                    "quantity": qty,
+                    "transaction_type": "BUY",
+                    "product": "I",
+                    "price": price
+                }
+            ]
+        }
+        try:
+            headers = {**self._get_headers(), 'Content-Type': 'application/json', 'Accept': 'application/json'}
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    # Parse final_margin
+                    final_margin = data['data'].get('final_margin', 0.0)
+                    total_value = qty * price
+                    if final_margin > 0:
+                        leverage = total_value / final_margin
+                        return {
+                            "status": "success",
+                            "leverage": leverage,
+                            "intraday_supported": True,
+                            "required_margin": final_margin
+                        }
+            
+            # If not successful or non-200 status, parse and return the error message
+            reason = "Unknown rejection/API error"
+            if response.text:
+                try:
+                    data = response.json()
+                    errors = data.get('errors', [])
+                    if errors:
+                        reason = errors[0].get('message', 'Rejected')
+                    else:
+                        reason = response.text
+                except Exception:
+                    reason = response.text
+            else:
+                reason = f"HTTP Error {response.status_code}"
+                    
+            logger.warning(f"Margin check failed for {instrument_key}: {reason}")
+            return {
+                "status": "failed",
+                "leverage": 0.0,
+                "intraday_supported": False,
+                "reason": reason
+            }
+        except Exception as e:
+            logger.error(f"Error checking margin/leverage for {instrument_key}: {e}")
+            return {
+                "status": "failed",
+                "leverage": 0.0,
+                "intraday_supported": False,
+                "reason": str(e)
+            }
+

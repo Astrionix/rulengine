@@ -100,6 +100,8 @@ Pipeline stats:
   Claude ENTER decisions: {stats.get('claude_enters', 'N/A')}
   Trades executed: {total}
   Claude calls made: {stats.get('claude_calls', 'N/A')}
+  Claude overrides (skips on local rules ENTER): {stats.get('claude_skips_overriding_rules', 0)}
+
 
 Market close:
   Nifty: {nifty_close:.2f} ({nifty_change_pct:+.2f}% today)

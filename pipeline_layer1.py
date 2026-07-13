@@ -72,17 +72,19 @@ class MorningPreFilter:
             
             for item in scraped_stocks:
                 symbol = item["symbol"]
-                if symbol in universe and symbol not in existing_symbols:
-                    qualifying.append({
-                        "symbol": symbol,
-                        "instrument_key": universe[symbol],
-                        "direction_bias": item["direction_bias"],
-                        "vol_ratio_20day": None,
-                        "relative_strength_5day": None,
-                        "price_vs_ema20_daily": None,
-                        "price_vs_20day_high_pct": None
-                    })
-                    added_count += 1
+                if symbol not in existing_symbols:
+                    key = Config.SYMBOLS_MAPPING.get(symbol.upper())
+                    if key:
+                        qualifying.append({
+                            "symbol": symbol,
+                            "instrument_key": key,
+                            "direction_bias": item["direction_bias"],
+                            "vol_ratio_20day": None,
+                            "relative_strength_5day": None,
+                            "price_vs_ema20_daily": None,
+                            "price_vs_20day_high_pct": None
+                        })
+                        added_count += 1
             logger.info(f"[Layer 1] Scraper successfully added {added_count} breakout stocks to the watchlist.")
         except Exception as scraper_err:
             logger.error(f"[Layer 1] External breakout scraping failed: {scraper_err}. Continuing with standard filters.")

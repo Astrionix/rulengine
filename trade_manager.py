@@ -140,7 +140,9 @@ class TradeManager:
             'pnl': 0.0,
             'status': 'OPEN',
             'metadata': metadata or {},
-            'sl_order_id': sl_order_id
+            'sl_order_id': sl_order_id,
+            'mfe': entry_price,
+            'mae': entry_price
         }
         self.active_trades.append(trade)
         logger.info(f"Trade added: {trade}")
@@ -161,7 +163,11 @@ class TradeManager:
                 target_price=target,
                 entry_time=get_ist_now(),
                 status='OPEN',
-                ai_score=float(score)
+                ai_score=float(score),
+                mfe=entry_price,
+                mae=entry_price,
+                discovery_score=metadata.get('discovery_score') if metadata else None,
+                discovery_rank=metadata.get('discovery_rank') if metadata else None
             )
             db.add(db_trade)
             db.commit()
@@ -170,7 +176,7 @@ class TradeManager:
         finally:
             db.close()
         
-    def update_prices(self, current_data: dict, execution_engine=None):
+    def update_prices(self, current_data: dict, execution_engine=None, market_regime="UNKNOWN"):
         '''
         current_data is a dict of symbol: current_price
         '''
@@ -180,6 +186,14 @@ class TradeManager:
                 price = current_data[sym]
                 trade['current_price'] = price
                 
+                # Track MFE and MAE
+                if trade['side'] == 'BUY':
+                    trade['mfe'] = max(trade.get('mfe', trade['entry_price']), price)
+                    trade['mae'] = min(trade.get('mae', trade['entry_price']), price)
+                else:
+                    trade['mfe'] = min(trade.get('mfe', trade['entry_price']), price)
+                    trade['mae'] = max(trade.get('mae', trade['entry_price']), price)
+                
                 # Calculate PnL based on side
                 if trade['side'] == 'BUY':
                     trade['pnl'] = (price - trade['entry_price']) * trade['qty']
@@ -187,7 +201,118 @@ class TradeManager:
                     trade['pnl'] = (trade['entry_price'] - price) * trade['qty']
                 
                 self.check_exit_conditions(trade, execution_engine)
-                self.manage_trailing_sl(trade, execution_engine)
+                self.manage_trailing_sl(trade, execution_engine, market_regime)
+                self.check_skipped_sl(trade, execution_engine)
+
+    def check_skipped_sl(self, trade: dict, execution_engine=None):
+        """Check if the stop loss trigger was breached but the order remains open on the exchange (Fix C)."""
+        if not execution_engine:
+            return
+            
+        # Paper trades do not have real stop loss orders
+        if trade.get('metadata', {}).get('paper_trade', False):
+            return
+            
+        if trade.get('status') != 'OPEN':
+            return
+            
+        sl = trade['sl']
+        price = trade['current_price']
+        side = trade['side']
+        sl_order_id = trade.get('sl_order_id')
+        
+        if not sl_order_id or str(sl_order_id).startswith("virtual_") or sl_order_id == "circuit_limit_blocked":
+            return
+            
+        # Check if price has crossed past the Stop Loss trigger
+        is_past_sl = False
+        if side == 'BUY' and price <= sl:
+            is_past_sl = True
+        elif side == 'SELL' and price >= sl:
+            is_past_sl = True
+            
+        if is_past_sl:
+            # Throttle the status check to once every 2 seconds to avoid rate limits
+            import time
+            now = time.time()
+            last_check = trade.get('last_sl_status_check_time', 0)
+            if now - last_check < 2.0:
+                return
+            trade['last_sl_status_check_time'] = now
+            
+            try:
+                logger.info(f"Skipped SL Monitor: Price is past SL ({price} vs {sl}) for {trade['symbol']}. Checking status of order {sl_order_id} on Upstox...")
+                status_res = execution_engine.get_order_status(sl_order_id)
+                if status_res and status_res.get('status') == 'success':
+                    order_status = str(status_res.get('order_status', '')).upper()
+                    logger.info(f"Skipped SL Monitor: Order status for {trade['symbol']} is {order_status}")
+                    
+                    # If order is still open or trigger pending on the exchange, it has been skipped!
+                    if order_status in ('OPEN', 'TRIGGER_PENDING', 'VALIDATION_PENDING', 'PUT_ORDER_REQ_RECEIVED'):
+                        logger.warning(f"⚠️ [SKIPPED SL DETECTED] Stop loss order {sl_order_id} was skipped for {trade['symbol']} (Market: {price}, SL: {sl}). Triggering Emergency Exit!")
+                        self.trigger_emergency_exit(trade, execution_engine)
+            except Exception as e:
+                logger.error(f"Error checking order status in Skipped SL Monitor: {e}")
+
+    def trigger_emergency_exit(self, trade: dict, execution_engine):
+        """Execute a safe cancel-then-market-exit fail-safe routine to close an un-executed skipped stop loss position (Fix C)."""
+        symbol = trade['symbol']
+        sl_order_id = trade.get('sl_order_id')
+        symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(symbol)
+        
+        if not symbol_key:
+            logger.error(f"Cannot perform emergency exit: missing symbol key for {symbol}")
+            return
+            
+        logger.warning(f"🚨 [EMERGENCY EXIT] Initiating emergency market exit for {symbol}...")
+        
+        # 1. Cancel the pending Stop Loss order
+        if sl_order_id and not str(sl_order_id).startswith("virtual_"):
+            logger.info(f"[EMERGENCY EXIT] Step 1: Canceling pending Stop Loss order {sl_order_id}...")
+            cancel_res = execution_engine.cancel_order(sl_order_id)
+            logger.info(f"[EMERGENCY EXIT] Cancel order response: {cancel_res}")
+            
+        # 2. Wait 1 second for cancellation confirmation/settlement
+        import time
+        time.sleep(1.0)
+        
+        # 3. Fetch positions from Upstox to verify quantity
+        try:
+            logger.info(f"[EMERGENCY EXIT] Step 2: Fetching live positions book from Upstox...")
+            positions = execution_engine.get_positions()
+            net_qty = 0
+            for pos in positions:
+                if pos.get('instrument_token') == symbol_key:
+                    net_qty = int(pos.get('quantity', 0))
+                    break
+            
+            logger.info(f"[EMERGENCY EXIT] Net position quantity for {symbol}: {net_qty}")
+            
+            # 4. Place standard market exit order if position still open
+            if (trade['side'] == 'BUY' and net_qty > 0) or (trade['side'] == 'SELL' and net_qty < 0):
+                abs_qty = abs(net_qty)
+                counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
+                logger.warning(f"🚨 [EMERGENCY EXIT] Step 3: Placing standard MARKET order to close {abs_qty} shares of {symbol}...")
+                
+                place_res = execution_engine.place_order_with_retry(symbol_key, counter_side, abs_qty)
+                logger.warning(f"[EMERGENCY EXIT] Market order response: {place_res}")
+                
+                # Mark trade as closed in database
+                self.close_trade(trade, "EMERGENCY_SKIPPED_SL_EXIT", execution_engine)
+                
+                # Send critical Telegram alert
+                try:
+                    from telegram_alert import send_telegram
+                    send_telegram(f"🚨 **CRITICAL: Emergency Exit Executed for {symbol}**!\n"
+                                  f"Stop Loss Limit order was skipped by the market.\n"
+                                  f"Bot successfully canceled SL and squared off {abs_qty} shares at market.")
+                except Exception as ta_err:
+                    logger.error(f"Failed to send emergency exit alert: {ta_err}")
+            else:
+                logger.info(f"[EMERGENCY EXIT] No open position found for {symbol} in broker positions. Marking trade as closed.")
+                self.close_trade(trade, "SL Hit", execution_engine)
+        except Exception as ex:
+            logger.error(f"Failed to perform emergency exit sequence: {ex}")
 
     def check_exit_conditions(self, trade: dict, execution_engine=None):
         price = trade['current_price']
@@ -206,20 +331,21 @@ class TradeManager:
                 exit_trade = True
                 exit_reason = "SL Hit"
                 
-        # Also check time > 3:15 PM
+        # Also check time >= 3:15 PM
         now = get_ist_now()
-        if now.hour == 15 and now.minute >= 15:
+        if (now.hour == 15 and now.minute >= 15) or now.hour > 15:
             exit_trade = True
-            exit_reason = "Time Exit (> 3:15 PM)"
+            exit_reason = "Time Exit (>= 3:15 PM)"
 
         if exit_trade:
             self.close_trade(trade, exit_reason, execution_engine)
 
-    def manage_trailing_sl(self, trade: dict, execution_engine=None):
+    def manage_trailing_sl(self, trade: dict, execution_engine=None, market_regime="UNKNOWN"):
         """
-        2-stage trailing Stop Loss logic (Section 5).
-        1. When price reaches +1x ATR, trigger breakeven: Move SL to entry_price (one-time).
-        2. When price reaches +2x ATR, trigger active trailing: Trail SL to (LTP - 1x ATR), updated every cycle.
+        2-stage trailing Stop Loss logic (Section 5, updated with Fixes 2 & 3).
+        1. Stage 1 (Breakeven): Triggered based on regime-adaptive R-multiple.
+           Moves SL to entry +/- 0.05 * ATR (true zero-loss).
+        2. Stage 2 (Active Trailing): Triggers at +2x ATR and trails at LTP - 1x ATR.
         """
         import market_feed
         # Prevent trailing if tick feed is stale
@@ -242,6 +368,32 @@ class TradeManager:
         if atr_14 <= 0:
             return
 
+        # Fix 3: Regime-Adaptive Breakeven Trigger
+        active_regime = "UNKNOWN"
+        regime_str = str(market_regime or "UNKNOWN").upper()
+        if regime_str == "UNKNOWN":
+            regime_str = str(metadata.get('market_regime', 'UNKNOWN')).upper()
+
+        if "RANGE" in regime_str or "CHOP" in regime_str:
+            active_regime = "RANGING"
+            r_mult = 0.4
+        elif "TREND" in regime_str:
+            active_regime = "TRENDING"
+            r_mult = 0.75
+        else:
+            active_regime = "UNKNOWN"
+            r_mult = 0.5
+
+        # Calculate initial risk R
+        initial_sl = trade.get('initial_sl', trade['sl'])
+        risk = abs(entry - initial_sl)
+        
+        # Calculate trigger offset (fallback to 1.0x ATR if risk is invalid)
+        if risk > 0:
+            trigger_offset = r_mult * risk
+        else:
+            trigger_offset = atr_14
+
         if 'breakeven_triggered' not in trade:
             trade['breakeven_triggered'] = False
 
@@ -249,11 +401,15 @@ class TradeManager:
         
         # 1. 2-stage trailing calculation
         if side == 'BUY':
-            # Stage 1: Breakeven (+1x ATR)
-            if not trade['breakeven_triggered'] and price >= entry + atr_14:
-                new_sl = entry - (0.3 * atr_14)
+            # Stage 1: Breakeven (Regime-adaptive R-multiple)
+            if not trade['breakeven_triggered'] and price >= entry + trigger_offset:
+                new_sl = entry + (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
                 trade['breakeven_triggered'] = True
-                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry} with buffer {new_sl}")
+                logger.info(
+                    f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
+                    f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
+                    f"regime={active_regime} ({regime_str})"
+                )
             
             # Stage 2: Active Trailing (+2x ATR)
             if price >= entry + 2 * atr_14:
@@ -263,11 +419,15 @@ class TradeManager:
                     new_sl = candidate_sl
                     logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
         else: # SELL
-            # Stage 1: Breakeven (+1x ATR)
-            if not trade['breakeven_triggered'] and price <= entry - atr_14:
-                new_sl = entry + (0.3 * atr_14)
+            # Stage 1: Breakeven (Regime-adaptive R-multiple)
+            if not trade['breakeven_triggered'] and price <= entry - trigger_offset:
+                new_sl = entry - (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
                 trade['breakeven_triggered'] = True
-                logger.info(f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']} @ entry price {entry} with buffer {new_sl}")
+                logger.info(
+                    f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
+                    f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
+                    f"regime={active_regime} ({regime_str})"
+                )
             
             # Stage 2: Active Trailing (+2x ATR)
             if price <= entry - 2 * atr_14:
@@ -282,21 +442,88 @@ class TradeManager:
         rounded_current_sl = round(trade['sl'] * 20) / 20.0
 
         # If a physically new SL triggers, process it on the server
+        is_paper = trade.get('metadata', {}).get('paper_trade', False)
+
+        # If a physically new SL triggers, process it on the server (unless it is a paper trade)
         if abs(rounded_new_sl - rounded_current_sl) >= 0.05:
-            if execution_engine:
+            if execution_engine and not is_paper:
                 symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
                 
-                # 1. Cancel existing SL order
-                if sl_order_id:
-                    cancel_res = execution_engine.cancel_order(sl_order_id)
-                    logger.info(f"Canceled old SL order {sl_order_id} for {trade['symbol']}: {cancel_res}")
+                # Check if we have a valid, active stop loss order ID on Upstox
+                has_active_sl = (sl_order_id and 
+                                 not str(sl_order_id).startswith("virtual_") and 
+                                 sl_order_id != "circuit_limit_blocked")
                 
-                # 2. Place new SL order
-                place_res = execution_engine.place_stop_loss(symbol_key, side, qty, rounded_new_sl)
+                if has_active_sl:
+                    # 1. Atomic Order Modification
+                    logger.info(f"Modifying existing Stop Loss order {sl_order_id} for {trade['symbol']} to trigger at {rounded_new_sl}...")
+                    res = execution_engine.modify_order(
+                        order_id=sl_order_id,
+                        new_price=0,  # Auto-calculated limit price with correct 0.1% buffer
+                        new_trigger=rounded_new_sl,
+                        qty=qty,
+                        order_type="SL",
+                        transaction_type=side
+                    )
+                    
+                    # Binary search recovery: if modification fails, search intermediate SL trigger prices
+                    if res.get('status') != 'success':
+                        logger.warning(f"Trailing SL modification to {rounded_new_sl} failed: {res.get('reason', 'Unknown error')}. Attempting binary search recovery...")
+                        price_diff = rounded_new_sl - rounded_current_sl
+                        
+                        if abs(price_diff) >= 0.20:
+                            best_accepted = rounded_current_sl
+                            l = rounded_current_sl
+                            h = rounded_new_sl
+                            
+                            # Perform 4 binary search iterations to narrow down maximum allowable SL
+                            for iteration in range(4):
+                                mid = (l + h) / 2.0
+                                mid_rounded = round(mid * 20) / 20.0
+                                
+                                if mid_rounded == round(l * 20) / 20.0 or mid_rounded == round(h * 20) / 20.0:
+                                    break
+                                    
+                                logger.info(f"[BINARY SEARCH SL] Step {iteration+1}: Trying intermediate trigger {mid_rounded} between {l} and {h}...")
+                                step_res = execution_engine.modify_order(
+                                    order_id=sl_order_id,
+                                    new_price=0,
+                                    new_trigger=mid_rounded,
+                                    qty=qty,
+                                    order_type="SL",
+                                    transaction_type=side
+                                )
+                                
+                                if step_res.get('status') == 'success':
+                                    best_accepted = mid_rounded
+                                    res = step_res
+                                    l = mid_rounded
+                                else:
+                                    h = mid_rounded
+                                    
+                            if best_accepted != rounded_current_sl:
+                                rounded_new_sl = best_accepted
+                                logger.info(f"Successfully recovered: Trailing SL modified to maximum accepted trigger {rounded_new_sl} for {trade['symbol']}")
+                            else:
+                                logger.error(f"Binary search recovery failed: All intermediate SL modifications rejected. Keeping original SL at {rounded_current_sl}.")
+                        else:
+                            logger.error(f"Trailing SL modification failed. Gap is too small for binary search recovery. Keeping original SL at {rounded_current_sl}.")
+                else:
+                    # 2. Place new Stop Loss order
+                    logger.info(f"No active SL order found for {trade['symbol']}. Placing a new Stop Loss order at {rounded_new_sl}...")
+                    res = execution_engine.place_stop_loss(symbol_key, side, qty, rounded_new_sl)
                 
-                # For virtual trades, we expect this to be rejected. We just update it internally anyway.
-                if place_res.get('status') == 'success' or str(sl_order_id).startswith("virtual_"):
-                    new_sl_order_id = place_res.get('order_id')
+                # Check for circuit limit hit
+                if res.get('status') == 'circuit_limit':
+                    from telegram_alert import alert_circuit_limit_hit
+                    alert_circuit_limit_hit(trade['symbol'], side, qty, rounded_new_sl, "trailing stop loss adjustment")
+                    trade['manual_exit_required'] = True
+                    trade['sl'] = rounded_new_sl
+                    logger.error(f"[CIRCUIT LIMIT] Trailing SL for {trade['symbol']} hit circuit limit: {res.get('reason')}")
+                
+                # For virtual trades or successful modifications/placements
+                elif res.get('status') == 'success' or (sl_order_id and str(sl_order_id).startswith("virtual_")):
+                    new_sl_order_id = res.get('order_id') or sl_order_id
                     if not new_sl_order_id and str(sl_order_id).startswith("virtual_"):
                         new_sl_order_id = f"virtual_sl_{trade['symbol']}_{str(uuid.uuid4())[:6]}"
                         
@@ -326,9 +553,9 @@ class TradeManager:
                     except Exception as ta_err:
                         logger.error(f"Failed to send trailing SL alert: {ta_err}")
                 else:
-                    logger.error(f"Failed to place new trailed SL for {trade['symbol']}")
+                    logger.error(f"Failed to update trailed SL for {trade['symbol']}: {res.get('reason', 'Unknown error')}")
             else:
-                trade_logger.info(f"TRAILED LOCAL SL (2-Stage): {trade['symbol']} | Old: {rounded_current_sl} | New: {rounded_new_sl}")
+                trade_logger.info(f"TRAILED {'PAPER' if is_paper else 'LOCAL'} SL (2-Stage): {trade['symbol']} | Old: {rounded_current_sl} | New: {rounded_new_sl}")
                 trade['sl'] = rounded_new_sl
                 # Dispatch local trailing alert
                 try:
@@ -344,30 +571,43 @@ class TradeManager:
         trade['exit_time'] = get_ist_now().isoformat()
         
         sl_order_id = trade.get('sl_order_id')
-        if execution_engine:
-            # 1. Cancel pending SL order on Upstox
-            if sl_order_id:
+        is_paper = trade.get('metadata', {}).get('paper_trade', False)
+        
+        if execution_engine and not is_paper:
+            # 1. Cancel pending SL order on Upstox (skip if SL Hit because it's already filled/completed)
+            if reason != "SL Hit" and sl_order_id and not str(sl_order_id).startswith("virtual_"):
                 try:
                     logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
                     execution_engine.cancel_order(sl_order_id)
                 except Exception as e:
                     logger.error(f"Failed to cancel SL order {sl_order_id}: {e}")
                     
-            # 2. Place actual market exit order so it logs in Upstox (even if rejected)
-            symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
-            if symbol_key:
-                counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
-                logger.info(f"Submitting square-off order to Upstox for {trade['symbol']} ({reason})")
-                try:
-                    execution_engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
-                except Exception as e:
-                    logger.error(f"Failed to place exit order on broker: {e}")
+            # 2. Place actual market exit order so it logs in Upstox (skip if SL Hit on a real broker order, or emergency routine already exited)
+            is_virtual_sl = not sl_order_id or str(sl_order_id).startswith("virtual_")
+            skip_market_exit = False
+            
+            if reason == "EMERGENCY_SKIPPED_SL_EXIT":
+                skip_market_exit = True
+            elif reason == "SL Hit" and not is_virtual_sl:
+                # Broker already executed the real SL order
+                skip_market_exit = True
+                
+            if not skip_market_exit:
+                symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+                if symbol_key:
+                    counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
+                    logger.info(f"Submitting square-off order to Upstox for {trade['symbol']} ({reason}, virtual_sl={is_virtual_sl})")
+                    try:
+                        execution_engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
+                    except Exception as e:
+                        logger.error(f"Failed to place exit order on broker: {e}")
         
         # Consecutive Losses Tracking (Now isolated by TradeManager instance)
         if not hasattr(self, 'consecutive_losses'):
             self.consecutive_losses = 0
             
-        if trade['pnl'] < 0:
+        pnl_val = trade.get('pnl', 0.0)
+        if pnl_val < 0:
             self.consecutive_losses += 1
             logger.info(f"[USER {self.user_id}] PnL negative. Consecutive losses count: {self.consecutive_losses}")
         elif trade['pnl'] > 0:
@@ -429,6 +669,8 @@ class TradeManager:
                 db_trade.exit_reason = reason
                 db_trade.realized_pnl = float(trade['pnl'])
                 db_trade.sl_price = float(trade['sl'])
+                db_trade.mfe = float(trade.get('mfe', trade['entry_price']))
+                db_trade.mae = float(trade.get('mae', trade['entry_price']))
                 db.commit()
                 
             # Update Daily Stats aggregate for THIS user
@@ -457,14 +699,36 @@ class TradeManager:
             db.close()
 
     def get_daily_pnl(self) -> float:
-        history_pnl = sum([t['pnl'] for t in self.trade_history if t['timestamp'][:10] == get_ist_now().isoformat()[:10]])
+        from sqlalchemy import func
+        today = get_ist_date()
+        db = SessionLocal()
+        try:
+            result = db.query(func.sum(Trade.realized_pnl)).filter(
+                Trade.user_id == self.user_id,
+                Trade.trade_date == today,
+                Trade.status == 'CLOSED'
+            ).scalar()
+            closed_pnl = float(result or 0.0)
+        except Exception as e:
+            logger.error(f"Error querying daily closed PnL from DB: {e}")
+            # Fallback to local history
+            closed_pnl = sum([t['pnl'] for t in self.trade_history if t.get('exit_time') and t.get('exit_time')[:10] == get_ist_now().isoformat()[:10]])
+        finally:
+            db.close()
         active_pnl = sum([t['pnl'] for t in self.active_trades])
-        return history_pnl + active_pnl
+        return closed_pnl + active_pnl
 
     def get_trades_taken_today(self) -> int:
-        count = 0
-        today_str = get_ist_now().isoformat()[:10]
-        for t in self.trade_history + self.active_trades:
-            if t['timestamp'][:10] == today_str:
-                count += 1
+        today = get_ist_date()
+        db = SessionLocal()
+        try:
+            count = db.query(Trade).filter(
+                Trade.user_id == self.user_id,
+                Trade.trade_date == today
+            ).count()
+        except Exception as e:
+            logger.error(f"Error querying trades count from DB: {e}")
+            count = len([t for t in self.trade_history + self.active_trades if t['timestamp'][:10] == get_ist_now().isoformat()[:10]])
+        finally:
+            db.close()
         return count

@@ -60,7 +60,7 @@ class OpeningRangeBreakout:
         self._fired    = set() # symbols that already generated an ORB signal today
         self._obs_done = False # True once 9:30 AM passes
         self.signals_today = 0 # Track ORB signals count
-        self.current_date = None # Date for which the current state is valid
+        self._date = None # Date for which the current state is valid
         logger.info(f"[ORB] Initialized Opening Range Breakout strategy for user_id={user_id}")
 
     def reset(self):
@@ -69,7 +69,7 @@ class OpeningRangeBreakout:
         self._fired.clear()
         self._obs_done = False
         self.signals_today = 0
-        self.current_date = None
+        self._date = None
         logger.info("[ORB] Daily state reset.")
 
     def _check_date_reset(self):
@@ -274,13 +274,17 @@ class OpeningRangeBreakout:
             if ltp <= 0:
                 continue
 
-            # Determine if a breakout has occurred (use LTP as proxy for candle close)
-            breakout_long  = ltp > or_high * 1.001   # price 0.1% above ORB high
-            breakout_short = ltp < or_low  * 0.999   # price 0.1% below ORB low
-
+            # Determine if a breakout has occurred (use completed 1-min candle close to avoid wick rejections - Fix 6)
+            last_1min_close = self._get_last_1min_close(instrument_key, engine)
+            if last_1min_close <= 0.0:
+                last_1min_close = ltp  # fallback to LTP if data fetch failed
+                
+            breakout_long  = last_1min_close > or_high * 1.001   # close 0.1% above ORB high
+            breakout_short = last_1min_close < or_low  * 0.999   # close 0.1% below ORB low
+ 
             if not (breakout_long or breakout_short):
                 continue
-
+ 
             direction = "LONG" if breakout_long else "SHORT"
 
             # Nifty direction filter
@@ -328,7 +332,20 @@ class OpeningRangeBreakout:
                 )
                 continue
 
-            or_range_pct = ((or_high - or_low) / or_low * 100) if or_low > 0 else 0
+            # Fetch actual ATR-14 from 5-min candles (Fix 1)
+            atr_14 = 0.0
+            try:
+                from features import compute_features
+                df_5min = engine.get_ohlc(instrument_key, interval="5minute")
+                if not df_5min.empty and len(df_5min) >= 20:
+                    df_5min = compute_features(df_5min)
+                    if not df_5min.empty:
+                        atr_14 = float(df_5min.iloc[-2].get('atr_14', 0.0))
+            except Exception as e:
+                logger.warning(f"[ORB] Failed to compute ATR for {symbol}: {e}")
+                
+            if atr_14 <= 0.0:
+                atr_14 = entry_price * 0.005  # fallback to 0.5% default
 
             self._fired.add(symbol)
 
@@ -352,6 +369,7 @@ class OpeningRangeBreakout:
                 "ema_20":          0.0,
                 "candle_strength": 1.0,
                 "price_vs_vwap":   0.0,
+                "atr_14":          round(atr_14, 2),
             }
             signals.append(sig)
             self.signals_today += 1
@@ -379,3 +397,14 @@ class OpeningRangeBreakout:
         except Exception as e:
             logger.warning(f"[ORB] Volume check failed for {instrument_key}: {e}")
             return 0.0
+
+    def _get_last_1min_close(self, instrument_key: str, engine) -> float:
+        """Fetch the close price of the last completed 1-minute candle."""
+        try:
+            df = engine.get_ohlc(instrument_key, interval="1minute")
+            if df is not None and not df.empty and len(df) >= 2:
+                # index -2 is the last fully completed closed 1-minute candle
+                return float(df.iloc[-2]['close'])
+        except Exception as e:
+            logger.warning(f"[ORB] Failed to fetch 1-min candle close for {instrument_key}: {e}")
+        return 0.0

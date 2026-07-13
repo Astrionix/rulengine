@@ -18,27 +18,30 @@ IST = pytz.timezone('Asia/Kolkata')
 logger = logging.getLogger(__name__)
 
 
-def run_reconciliation(execution_engine, user_id: int = None) -> dict:
+def run_reconciliation(execution_engine, user_id: int = None, intraday: bool = False) -> dict:
     """
     Reconcile DB trades against Upstox trade book.
     
     Args:
         execution_engine: For fetching the Upstox trade book
         user_id: Optional user_id filter
+        intraday: If True, checks both OPEN and CLOSED trades and alerts only on mismatch without DB persistence.
         
     Returns:
         Dict with reconciliation results.
     """
     today = get_ist_date()
-    logger.info(f"[Reconciliation] Starting for {today}...")
+    logger.info(f"[Reconciliation] Starting (intraday={intraday}) for {today}...")
 
     # Fetch DB trades
     db = SessionLocal()
     try:
         query = db.query(Trade).filter(
-            Trade.trade_date == today,
-            Trade.status == "CLOSED"
+            Trade.trade_date == today
         )
+        if not intraday:
+            query = query.filter(Trade.status == "CLOSED")
+            
         if user_id:
             query = query.filter(Trade.user_id == user_id)
         db_trades = query.all()
@@ -122,30 +125,31 @@ def run_reconciliation(execution_engine, user_id: int = None) -> dict:
                     })
 
     # Save results to DB
-    details_dict = {
-        "mismatches": mismatches,
-        "ghost_trades": ghost_trades,
-        "untracked_trades": untracked,
-    }
-    details_json = json.dumps(details_dict, default=str)
+    if not intraday:
+        details_dict = {
+            "mismatches": mismatches,
+            "ghost_trades": ghost_trades,
+            "untracked_trades": untracked,
+        }
+        details_json = json.dumps(details_dict, default=str)
 
-    db = SessionLocal()
-    try:
-        recon = DailyReconciliation(
-            date=today,
-            total_trades=len(db_trades),
-            mismatches=len(mismatches),
-            ghost_trades=len(ghost_trades),
-            untracked_trades=len(untracked),
-            details=details_json,
-        )
-        db.add(recon)
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"[Reconciliation] Error saving results: {e}")
-    finally:
-        db.close()
+        db = SessionLocal()
+        try:
+            recon = DailyReconciliation(
+                date=today,
+                total_trades=len(db_trades),
+                mismatches=len(mismatches),
+                ghost_trades=len(ghost_trades),
+                untracked_trades=len(untracked),
+                details=details_json,
+            )
+            db.add(recon)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"[Reconciliation] Error saving results: {e}")
+        finally:
+            db.close()
 
     # Send Telegram alert
     details_str = ""
@@ -162,7 +166,19 @@ def run_reconciliation(execution_engine, user_id: int = None) -> dict:
             f"  {u['instrument_key']} ({u['trade_id']}): ₹{u['price']} x{u['quantity']}" for u in untracked
         )
 
-    alert_reconciliation(len(mismatches), len(ghost_trades), len(untracked), details_str)
+    if intraday:
+        if mismatches or ghost_trades or untracked:
+            from telegram_alert import send_telegram_critical
+            msg = (
+                f"🚨 <b>INTRADAY RECONCILIATION DISCREPANCY DETECTED</b>\n"
+                f"• Mismatches: {len(mismatches)}\n"
+                f"• Ghost trades (in DB only): {len(ghost_trades)}\n"
+                f"• Untracked trades (in Upstox only): {len(untracked)}\n\n"
+                f"📋 Details:\n{details_str[:3000]}"
+            )
+            send_telegram_critical(msg)
+    else:
+        alert_reconciliation(len(mismatches), len(ghost_trades), len(untracked), details_str)
 
     result = {
         "total_trades": len(db_trades),

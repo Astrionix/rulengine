@@ -5251,7 +5251,7 @@
             document.getElementById('c-candle').value = config.MIN_CANDLE_STRENGTH || 0.6;
             document.getElementById('c-min-price').value = config.MIN_STOCK_PRICE || 50;
             document.getElementById('c-max-price').value = config.MAX_STOCK_PRICE || 5000;
-            document.getElementById('c-ai').value = config.USE_GROQ_FILTER ? 'true' : 'false';
+            document.getElementById('c-ai').value = config.USE_CLAUDE_FILTER ? 'true' : 'false';
             document.getElementById('c-hybrid-mode').value = config.HYBRID_VIRTUAL_MODE !== false ? 'true' : 'false';
             document.getElementById('c-mode').value = config.MODE || 'TEST';
             document.getElementById('c-use-live-capital').value = config.USE_LIVE_CAPITAL ? 'true' : 'false';
@@ -5306,7 +5306,7 @@
                 MIN_CANDLE_STRENGTH: parseFloat(document.getElementById('c-candle').value),
                 MIN_STOCK_PRICE: parseFloat(document.getElementById('c-min-price').value),
                 MAX_STOCK_PRICE: parseFloat(document.getElementById('c-max-price').value),
-                USE_GROQ_FILTER: document.getElementById('c-ai').value === 'true',
+                USE_CLAUDE_FILTER: document.getElementById('c-ai').value === 'true',
                 HYBRID_VIRTUAL_MODE: document.getElementById('c-hybrid-mode').value === 'true',
                 MODE: document.getElementById('c-mode').value,
                 USE_LIVE_CAPITAL: document.getElementById('c-use-live-capital').value === 'true',

@@ -160,6 +160,8 @@ class WatchlistRefresh:
                         "symbol": ms.symbol,
                         "instrument_key": ms.instrument_key,
                         "direction_bias": ms.direction_bias,
+                        "discovery_score": ms.discovery_score,
+                        "discovery_rank": ms.discovery_rank
                     }
                     self.active_watchlist.append(new_stock)
                     added.append(new_stock)

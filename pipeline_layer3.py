@@ -134,7 +134,9 @@ class SignalScanner:
             # Evaluate 5-minute signal conditions
             result = self._evaluate_signal(
                 symbol, instrument_key, direction_bias, ltp,
-                prices_cache, required_conditions
+                prices_cache, required_conditions,
+                discovery_score=stock.get("discovery_score"),
+                discovery_rank=stock.get("discovery_rank")
             )
             if result:
                 qualifying.append(result)
@@ -154,7 +156,9 @@ class SignalScanner:
 
     def _evaluate_signal(self, symbol: str, instrument_key: str,
                          direction_bias: str, ltp: float,
-                         prices_cache: dict, required_conditions: int) -> dict:
+                         prices_cache: dict, required_conditions: int,
+                         discovery_score: float = None,
+                         discovery_rank: int = None) -> dict:
         """
         Calculate features and check conditions threshold for a single stock.
         Returns signal dict if threshold met, None otherwise.
@@ -180,6 +184,34 @@ class SignalScanner:
                 return None
 
             latest = df.iloc[-2]  # Most recently COMPLETED candle
+            
+            # Guard against candle completeness (Fix 8)
+            try:
+                from datetime import timedelta
+                latest_ts = latest['timestamp']
+                if hasattr(latest_ts, 'tzinfo'):
+                    if latest_ts.tzinfo is None:
+                        latest_ts = IST.localize(latest_ts)
+                    else:
+                        latest_ts = latest_ts.astimezone(IST)
+                else:
+                    latest_ts = pd.to_datetime(latest_ts)
+                    if latest_ts.tzinfo is None:
+                        latest_ts = IST.localize(latest_ts)
+                    else:
+                        latest_ts = latest_ts.astimezone(IST)
+                    
+                now_ist = datetime.now(IST)
+                # If latest candle close time (start + 5m) is in the future, it is not fully completed yet!
+                if latest_ts + timedelta(minutes=5) > now_ist:
+                    logger.warning(
+                        f"[Layer 3] completeness guard triggered for {symbol}: "
+                        f"Candle {latest_ts.strftime('%H:%M')} + 5m is in future relative to {now_ist.strftime('%H:%M:%S')}"
+                    )
+                    return None
+            except Exception as tg_err:
+                logger.error(f"[Layer 3] Error in candle completeness guard for {symbol}: {tg_err}")
+
             prev = df.iloc[-3] if len(df) >= 3 else latest
 
             # ── Extract features ────────────────────────────────────────────
@@ -285,6 +317,8 @@ class SignalScanner:
                 "vol_ratio_6bar": round(vol_ratio_6bar, 2),
                 "candle_strength": round(candle_strength, 2),
                 "price_vs_vwap": round(price_vs_vwap, 4),
+                "discovery_score": discovery_score,
+                "discovery_rank": discovery_rank,
             }
 
         except Exception as e:

@@ -102,7 +102,7 @@ class UserConfig(Base):
     min_candle_strength    = Column(Float, default=0.6)
     min_stock_price        = Column(Float, default=50.0)
     max_stock_price        = Column(Float, default=5000.0)
-    use_groq_filter        = Column(Integer, default=1)  # 1=True, 0=False
+    use_claude_filter      = Column("use_groq_filter", Integer, default=1)  # 1=True, 0=False
     use_live_capital       = Column(Integer, default=0)
     manual_capital         = Column(Float, default=10000.0)
     hybrid_virtual_mode    = Column(Integer, default=1)  # 1=True, 0=False
@@ -156,6 +156,14 @@ class Trade(Base):
     time_of_day_bucket = Column(String(20), nullable=True)  # MORNING / MIDDAY / AFTERNOON
     market_regime     = Column(String(20), nullable=True)   # TRENDING_UP / RANGING etc
     would_have_entered_without_claude = Column(Boolean, default=False)
+    
+    # Execution Tracking (v4)
+    mfe = Column(Float, nullable=True) # Maximum Favorable Excursion
+    mae = Column(Float, nullable=True) # Maximum Adverse Excursion
+    
+    # Discovery Tracking (v4.1)
+    discovery_score = Column(Float, nullable=True)
+    discovery_rank  = Column(Integer, nullable=True)
 
     user = relationship("User", back_populates="trades")
 
@@ -210,6 +218,8 @@ class MorningWatchlist(Base):
     relative_strength_5day = Column(Float, nullable=True)
     price_vs_ema20_daily   = Column(Float, nullable=True)
     price_vs_20day_high_pct = Column(Float, nullable=True)
+    discovery_score        = Column(Float, nullable=True)
+    discovery_rank         = Column(Integer, nullable=True)
     created_at             = Column(DateTime, default=get_ist_now)
 
 

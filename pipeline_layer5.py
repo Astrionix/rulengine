@@ -39,9 +39,6 @@ Each object must contain exactly these fields:
   "direction":     <"LONG" | "SHORT">  — "direction" field always echoes signal_direction exactly,
                                          even on SKIP decisions. It is not a recommendation — 
                                          it identifies which setup was evaluated,
-  "entry_price":   <float>   — precise entry price in rupees (2 decimal places),
-  "stop_loss":     <float>   — precise stop-loss price in rupees (2 decimal places),
-  "target":        <float>   — precise target price in rupees (2 decimal places),
   "confidence":    <integer 1–5>  — 5 = very strong, 3 = acceptable, 1–2 = too weak,
   "reasoning":     <string>  — exactly 2 sentences: sentence 1 explains why ENTER or SKIP 
                                  (for SKIP decisions, sentence 1 must name the specific rule 
@@ -49,34 +46,6 @@ Each object must contain exactly these fields:
                                  sentence 2 names the single most important factor,
   "red_flags":     <string>  — specific concerns found in the data, or "none"
 }
-
-─── ENTRY PRICE RULES ───────────────────────────────────────────────────────────
-- For LONG: set entry_price at LTP + (0.05% to 0.10% buffer above LTP). This accounts
-  for MARKET order slippage. Do not set entry at a price below LTP for a LONG.
-- For SHORT: set entry_price at LTP - (0.05% to 0.10% buffer below LTP).
-- Never set entry_price more than 0.3% away from LTP in either direction.
-
-─── STOP-LOSS RULES ──────────────────────────────────────────────────────────────
-- Stop-loss must be placed at a logical market structure level, not at an arbitrary
-  distance. For LONG: SL goes just below support_20bar_5min (subtract 0.1% buffer).
-  For SHORT: SL goes just above resistance_20bar_5min (add 0.1% buffer).
-- If support/resistance is too close (risk < 0.3% of entry price), widen SL to
-  1x ATR below entry for LONG, 1x ATR above entry for SHORT.
-- Minimum SL distance: 0.3% of entry price.
-- Maximum SL distance: 1.5x ATR_14_5min from entry. If logical structure SL would be
-  wider than 1.5x ATR, return SKIP — the risk is too large.
-
-─── TARGET RULES ─────────────────────────────────────────────────────────────────
-- Target must deliver a minimum reward-to-risk ratio defined by target_multiplier in the input.
-  risk = abs(entry_price - stop_loss)
-  target must be at least: entry_price + (target_multiplier * risk) for LONG
-                            entry_price - (target_multiplier * risk) for SHORT
-- For LONG: target must not exceed resistance_20bar_5min. If achieving the required R:R target 
-  would require going above resistance_20bar_5min, return SKIP. 
-  The only exception: if vol_ratio_6bar_5min > 3.0 AND volume_trend is "expanding" — 
-  breakout through resistance is plausible. In this case, target can go up to 
-  resistance + 0.5% maximum.
-- Preferred target is at the next meaningful resistance level with required R:R.
 
 ─── MULTI-CANDLE STRUCTURE ANALYSIS ──────────────────────────────────────────
 You receive a list of the most recent completed 5-minute candles in the "recent_candles_5min" array (chronologically ordered, up to 20 candles maximum). Use this historical series to analyze the intermediate-term price action trend and volume profile:
@@ -125,7 +94,7 @@ MANDATORY SKIP conditions (return SKIP immediately, confidence is irrelevant):
      direction against the trade (upper wick for LONG, lower wick for SHORT), return SKIP 
      regardless of other factors.
   7. If any of these fields are null, zero, or missing: atr_14_5min, support_20bar_5min, 
-     resistance_20bar_5min, ltp → return SKIP with red_flags: "incomplete data". 
+     resistance_20bar_5min, ltp, cleared_previous_day_high, cleared_previous_day_low → return SKIP with red_flags: "incomplete data". 
      Never hallucinate or estimate missing structural values.
 
 CONFIDENCE THRESHOLDS:
@@ -141,8 +110,6 @@ TIME CONTEXT CONSTRAINTS:
   - If time_bucket is "AFTERNOON" (after 1:30 PM):
     - Require confidence >= 4 to ENTER (same as high VIX rule)
     - Add "late session entry" to red_flags automatically
-    - Be more conservative on targets — reduce calculated target distance from entry by 20% 
-      since there is less time for the trade to develop
   - If time_bucket is "MIDDAY" (12:00 PM - 1:30 PM):
     - Require confidence >= 4 to ENTER
     - Add "midday chop risk" to red_flags automatically
@@ -210,14 +177,24 @@ class ClaudeAnalyzer:
         time_str = now.strftime("%H:%M")
         date_str = now.strftime("%d-%b-%Y")
 
+        import copy
+        # Create a blinded payload for Claude (remove targets and multipliers)
+        blinded_payloads = copy.deepcopy(feature_payloads)
+        for p in blinded_payloads:
+            p.pop("calculated_entry", None)
+            p.pop("calculated_sl", None)
+            p.pop("calculated_target", None)
+            p.pop("target_multiplier", None)
+
         # Build user message
         user_message = (
             f"Analyze these intraday trade setups for {date_str}.\n"
             f"Market context: Nifty is {nifty_trend} today ({nifty_change_pct:+.2f}% from yesterday's close). "
             f"India VIX is {vix_value:.1f}.\n"
             f"Time of scan: {time_str} IST.\n\n"
-            f"{json.dumps(feature_payloads, indent=2)}\n\n"
-            f"Return a JSON array with exactly one decision object per stock, in the same order as input."
+            f"{json.dumps(blinded_payloads, indent=2)}\n\n"
+            f"Return a JSON array with exactly one decision object per stock, in the same order as input.\n"
+            f"Note: Target prices and Risk:Reward ratios have been hidden from you. Base your decision PURELY on structural setup quality, volume expansion, and breakout conviction."
         )
 
         # Make Claude API call
@@ -302,27 +279,26 @@ class ClaudeAnalyzer:
             if not original:
                 continue
 
-            # Check direction mismatch
-            expected_dir = original.get("signal_direction", "")
-            actual_dir = decision.get("direction", "")
-            if expected_dir and actual_dir and expected_dir != actual_dir:
-                logger.warning(f"[Layer 5] DIRECTION_MISMATCH for {symbol}: "
-                               f"expected {expected_dir}, got {actual_dir}. Treating as SKIP.")
-                decision["decision"] = "SKIP"
-                decision["direction"] = expected_dir
-                decision["reasoning"] = f"Direction mismatch detected. {decision.get('reasoning', '')}"
-
-            # Enforce confidence rules
-            confidence = decision.get("confidence", 0)
-            if confidence < 3:
-                decision["decision"] = "SKIP"
-
             # Ensure all required fields exist
             STRING_FIELDS = {"symbol", "decision", "direction", "reasoning", "red_flags"}
-            for field in ["symbol", "decision", "direction", "entry_price", "stop_loss", 
-                          "target", "confidence", "reasoning", "red_flags"]:
+            for field in ["symbol", "decision", "direction", "confidence", "reasoning", "red_flags"]:
                 if field not in decision:
                     decision[field] = "N/A" if field in STRING_FIELDS else 0
+                    
+            decision["discovery_score"] = original.get("discovery_score")
+            decision["discovery_rank"] = original.get("discovery_rank")
+
+            # Attach calculated targets from Layer 4 payload
+            if decision.get("decision") == "ENTER":
+                decision["entry_price"] = original.get("calculated_entry", 0.0)
+                decision["stop_loss"] = original.get("calculated_sl", 0.0)
+                decision["target"] = original.get("calculated_target", 0.0)
+                
+                # If Layer 4 didn't provide valid targets (should never happen), fallback
+                if decision["entry_price"] == 0.0 or decision["stop_loss"] == 0.0:
+                    logger.warning(f"[Layer 5 Validation] Symbol {symbol} missing Layer 4 computed targets. Downgraded to SKIP.")
+                    decision["decision"] = "SKIP"
+                    decision["red_flags"] = (decision.get("red_flags", "none") + ", missing_computed_targets").replace("none, ", "")
 
             # Enforce hard numerical checks on ENTER decisions to protect against LLM calculation errors
             if decision.get("decision") == "ENTER":

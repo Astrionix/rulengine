@@ -177,6 +177,7 @@ async def startup_event():
     logger.info("[WS] Upstox WebSocket Market Feed started.")
     asyncio.create_task(ws_fallback_pump())
     asyncio.create_task(periodic_stat_sync())
+    asyncio.create_task(dynamic_discovery_loop())
 
     # Auto-resume bots that were running before the server restarted
     db_resume = _db()
@@ -197,6 +198,150 @@ async def startup_event():
         logger.error(f"[Startup] Error auto-resuming user bots: {e}")
     finally:
         db_resume.close()
+
+async def dynamic_discovery_loop():
+    """
+    Review 1 Enhancement: Intraday Discovery Sub-Layer
+    Every 15 minutes, query Nifty 500 for massive volume/price breakouts 
+    and dynamically inject them into all active user bots' morning_watchlists.
+    """
+    try:
+        from nifty500_instruments import get_universe
+        from config import Config
+    except ImportError as e:
+        logger.error(f"[Discovery] Cannot import universe/config: {e}")
+        return
+
+    # Wait until 9:15 AM
+    while True:
+        now = datetime.now(IST)
+        if now.hour > 9 or (now.hour == 9 and now.minute >= 15):
+            break
+        await asyncio.sleep(60)
+
+    while True:
+        try:
+            now = datetime.now(IST)
+            # Stop discovering after 2:30 PM
+            if now.hour >= 14 and now.minute >= 30:
+                await asyncio.sleep(3600)
+                continue
+
+            # Need a valid bot/execution engine to fetch data
+            # Use the first active bot's engine
+            active_bots = user_bot_registry.all_bots()
+            if not active_bots:
+                await asyncio.sleep(60)
+                continue
+
+            bot = list(active_bots.values())[0]
+            engine = bot.engine
+            if not engine:
+                await asyncio.sleep(60)
+                continue
+
+            universe = get_universe()
+            # Resolve to keys using Config
+            keys_to_symbols = {}
+            for sym in universe:
+                k = Config.SYMBOLS_MAPPING.get(sym.upper())
+                if k:
+                    keys_to_symbols[k] = sym
+
+            all_keys = list(keys_to_symbols.keys())
+            
+            # Fetch Nifty and Sector Data for Relative Strength
+            nifty_chg_pct = 0.0
+            if hasattr(bot, 'layer4'):
+                nifty_chg_pct = bot.layer4.get_nifty_change_pct()
+                
+            from pipeline_layer3 import SignalScanner
+            dummy_l3 = SignalScanner(user_id=bot.user_id)
+            sector_perf = dummy_l3._sector_perf if hasattr(dummy_l3, '_sector_perf') else {}
+
+            scored_candidates = []
+
+            # Fetch quotes in chunks of 50
+            chunk_size = 50
+            for i in range(0, len(all_keys), chunk_size):
+                chunk = all_keys[i:i + chunk_size]
+                try:
+                    quotes = engine.get_market_quotes(chunk)
+                    for k, q in quotes.items():
+                        if 'ohlc' not in q:
+                            continue
+                        ohlc = q['ohlc']
+                        open_p = ohlc.get('open', 0)
+                        close_p = ohlc.get('close', 0)
+                        
+                        vol = q.get('volume', 0)
+                        if vol == 0 or open_p == 0:
+                            continue
+                            
+                        # Scan criteria: Up > 1.5% from open (lowered to allow more ranking context)
+                        pct_from_open = ((close_p - open_p) / open_p) * 100
+                        if pct_from_open > 1.5:
+                            sym = keys_to_symbols[k]
+                            
+                            # Calculate scoring components
+                            rs_vs_nifty = pct_from_open - nifty_chg_pct
+                            
+                            from nifty500_instruments import get_sector
+                            sector = get_sector(sym)
+                            sector_strength = sector_perf.get(sector, 0.0) if sector else 0.0
+                            
+                            # Composite Discovery Score
+                            score = pct_from_open + rs_vs_nifty + (sector_strength * 0.5)
+                            scored_candidates.append((score, sym))
+                            
+                except Exception as ce:
+                    logger.warning(f"[Discovery] Chunk fetch error: {ce}")
+                
+                await asyncio.sleep(1) # throttle API
+
+            if scored_candidates:
+                # Sort descending and take top 20, storing rank and score
+                scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                top_20 = [(i+1, x[1], x[0]) for i, x in enumerate(scored_candidates[:20])] # (Rank, Symbol, Score)
+                
+                # Add to MorningWatchlist in DB so Layer 2 picks it up across all user bots
+                from database import SessionLocal, MorningWatchlist, get_ist_date, get_ist_now
+                db = SessionLocal()
+                try:
+                    today = get_ist_date()
+                    existing_symbols = {r.symbol for r in db.query(MorningWatchlist).filter(MorningWatchlist.date == today).all()}
+                    
+                    new_symbols_count = 0
+                    for rank, sym, score in top_20:
+                        if sym not in existing_symbols:
+                            new_record = MorningWatchlist(
+                                date=today,
+                                symbol=sym,
+                                instrument_key=universe.get(sym),
+                                direction_bias="LONG_CANDIDATE", # Breakouts are naturally longs
+                                discovery_score=float(score),
+                                discovery_rank=int(rank),
+                                created_at=get_ist_now()
+                            )
+                            db.add(new_record)
+                            existing_symbols.add(sym)
+                            new_symbols_count += 1
+                    
+                    if new_symbols_count > 0:
+                        db.commit()
+                        logger.info(f"[Discovery] Injected {new_symbols_count} top-ranked breakouts into DB. Top score: {scored_candidates[0][0]:.2f}")
+                except Exception as db_err:
+                    logger.error(f"[Discovery] DB Insert Error: {db_err}")
+                    db.rollback()
+                finally:
+                    db.close()
+
+        except Exception as e:
+            logger.error(f"[Discovery] Error in discovery loop: {e}")
+
+        # Run every 15 minutes
+        await asyncio.sleep(15 * 60)
+
 
 async def periodic_stat_sync():
     """
@@ -420,7 +565,7 @@ def run_local_rule_analysis(feature_payloads: list) -> list:
 # ────────────────────────────────────────────────────────────────────────────
 
 def _evaluate_market_regime(bot, user_id, layer4, participation_ratio):
-    from telegram_alert import alert_telegram
+    from telegram_alert import send_telegram
     nifty_chg_pct = layer4.get_nifty_change_pct()
     vix_val = _shared_state.live_indices.get("NSE_INDEX|India VIX", 0)
     
@@ -466,7 +611,7 @@ def _evaluate_market_regime(bot, user_id, layer4, participation_ratio):
     logger.info(f"[USER {user_id}] Market Regime Classified: {bot.state.market_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
     
     if old_regime != "UNKNOWN" and old_regime != new_regime:
-        alert_telegram(f"⚠️ Market regime dynamically updated from {old_regime} to {new_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
+        send_telegram(f"⚠️ Market regime dynamically updated from {old_regime} to {new_regime} (Nifty: {nifty_chg_pct:.2f}%, VIX: {vix_val:.1f})")
 
 
 async def user_trading_cycle(user_id: int):
@@ -506,6 +651,37 @@ async def user_trading_cycle(user_id: int):
     # Recovery: Load watchlist from DB if restarting mid-day
     now = datetime.now(IST)
     current_date = now.date()
+    
+    # Recovery: check if daily summary or reconciliation was already done today
+    db_rec = SessionLocal()
+    try:
+        from database import SystemLog
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Query DAILY_SUMMARY
+        summary_log = db_rec.query(SystemLog).filter(
+            SystemLog.user_id == user_id,
+            SystemLog.event_type == "DAILY_SUMMARY",
+            SystemLog.timestamp >= start_of_day
+        ).first()
+        if summary_log:
+            daily_summary_sent = True
+            logger.info(f"[USER {user_id}] Recovered state: Daily summary was already sent today.")
+
+        # Query RECONCILIATION
+        recon_log = db_rec.query(SystemLog).filter(
+            SystemLog.user_id == user_id,
+            SystemLog.event_type == "RECONCILIATION",
+            SystemLog.timestamp >= start_of_day
+        ).first()
+        if recon_log:
+            reconciliation_done = True
+            logger.info(f"[USER {user_id}] Recovered state: Reconciliation was already done today.")
+    except Exception as rec_err:
+        logger.error(f"[USER {user_id}] Failed to recover daily summary/reconciliation state: {rec_err}")
+    finally:
+        db_rec.close()
+
     last_token = bot.creds.get("upstox_access_token") if (bot and bot.creds) else None
     if now.hour >= 9:
         existing_watchlist = layer2.load_active_watchlist()
@@ -572,6 +748,7 @@ async def user_trading_cycle(user_id: int):
             ws_disconnected = False
             orb_obs_complete = False
             orb.reset()
+            layer5.reset()
             
             # Reset VIX alert flags for the new day
             try:
@@ -719,10 +896,6 @@ async def user_trading_cycle(user_id: int):
             if bot.tm.active_trades:
                 logger.info(f"[USER {user_id}] 3:15 PM — Force exiting {len(bot.tm.active_trades)} active trades.")
                 for trade in list(bot.tm.active_trades):
-                    symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
-                    if symbol_key and not Config.PAPER_TRADING_MODE:
-                        counter_side = "SELL" if trade['side'].upper() == "BUY" else "BUY"
-                        bot.engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
                     bot.tm.close_trade(trade, "EOD_FORCED_EXIT", execution_engine=bot.engine)
                     alert_trade_exit(trade['symbol'], "EOD FORCED EXIT",
                                      trade['entry_price'], trade['current_price'], trade['pnl'])
@@ -749,6 +922,12 @@ async def user_trading_cycle(user_id: int):
                     user_id=user_id,
                 )
                 daily_summary_sent = True
+                from database import log_system_event
+                db_log = SessionLocal()
+                try:
+                    log_system_event(db_log, user_id, "INFO", "DAILY_SUMMARY", "Daily summary sent successfully")
+                finally:
+                    db_log.close()
             except Exception as e:
                 logger.error(f"[USER {user_id}] Daily summary failed: {e}")
 
@@ -757,6 +936,12 @@ async def user_trading_cycle(user_id: int):
             try:
                 run_reconciliation(bot.engine, user_id=user_id)
                 reconciliation_done = True
+                from database import log_system_event
+                db_log = SessionLocal()
+                try:
+                    log_system_event(db_log, user_id, "INFO", "RECONCILIATION", "Reconciliation completed successfully")
+                finally:
+                    db_log.close()
             except Exception as e:
                 logger.error(f"[USER {user_id}] Reconciliation failed: {e}")
 
@@ -894,7 +1079,7 @@ async def user_trading_cycle(user_id: int):
                                      "rr_ratio": orb_sig.get("rr_ratio", 0),
                                      "strategy": "ORB"},
                     }
-                    use_ai = bot.config.get("USE_GROQ_FILTER", True)
+                    use_ai = bot.config.get("USE_CLAUDE_FILTER", True)
                     if use_ai:
                         orb_decisions = layer5.analyze(
                             [orb_payload],
@@ -1000,12 +1185,13 @@ async def user_trading_cycle(user_id: int):
                         # Layer 4: Feature extraction
                         feature_payloads = layer4.extract(
                             signals, _shared_prices, _shared_state.live_indices, 
-                            market_regime=getattr(bot.state, "market_regime", "UNKNOWN")
+                            market_regime=getattr(bot.state, "market_regime", "UNKNOWN"),
+                            prev_close_cache=_shared_state.index_prev_close
                         )
 
                         if feature_payloads:
                             # Check if Generative Filter is enabled
-                            use_ai = bot.config.get("USE_GROQ_FILTER", True)
+                            use_ai = bot.config.get("USE_CLAUDE_FILTER", True)
 
                             if use_ai:
                                 # Layer 5: Claude analysis
@@ -1118,7 +1304,8 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
 
     # Map direction to side
     side = "BUY" if direction == "LONG" else "SELL"
-    symbol_key = Config.SYMBOLS_MAPPING.get(symbol)
+    import instrument_resolver
+    symbol_key = instrument_resolver.get_instrument_key(symbol)
     if not symbol_key:
         logger.warning(f"[USER {user_id}] Unknown symbol {symbol} in ENTER decision. Skipping.")
         return
@@ -1154,6 +1341,20 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     if active_trades_count >= max_open:
         logger.warning(f"[USER {user_id}] Max open trades limit reached ({active_trades_count}/{max_open}). Skipping trade for {symbol}.")
         return
+
+    # Step 3.6 — Sector concentration check (Fix 10)
+    from nifty500_instruments import get_sector
+    new_sector = get_sector(symbol)
+    if new_sector and new_sector != "Unknown" and new_sector != "Others":
+        for active in bot.tm.active_trades:
+            active_sector = get_sector(active['symbol'])
+            if active_sector == new_sector:
+                logger.warning(
+                    f"[USER {user_id}] Sector concentration block: "
+                    f"skipping {symbol} because we already have an active trade in '{new_sector}' ({active['symbol']})"
+                )
+                send_alert(user_id, f"⚠️ Sector concentration block: skipping {symbol} — already trading '{new_sector}' via {active['symbol']}.")
+                return
 
     # Step 4 — Quantity calculation (Risk-based)
     daily_loss_limit = bot.config.get('DAILY_LOSS_LIMIT', Config.DAILY_LOSS_LIMIT)
@@ -1209,6 +1410,21 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     # Find layer3 signal for this symbol (for conditions_met)
     l3_signal = next((s for s in layer3_signals if s["symbol"] == symbol), {})
     conditions_met = l3_signal.get("conditions_met", 0)
+
+    # Validate intraday support and 5x leverage availability prior to trading (real, hybrid, or paper)
+    # Using 4.5 threshold to allow for minor rounding/charges discrepancies
+    leverage_res = bot.engine.check_intraday_leverage(symbol_key, entry_price, quantity)
+    if not leverage_res.get("intraday_supported", False) or leverage_res.get("leverage", 0.0) < 4.5:
+        reason = leverage_res.get("reason", "Intraday not supported or leverage < 5x")
+        logger.warning(
+            f"[USER {user_id}] Skipping trade for {symbol}: 5x leverage/intraday not supported. "
+            f"Leverage: {leverage_res.get('leverage', 0.0):.2f}x, Intraday Supported: {leverage_res.get('intraday_supported')}. Detail: {reason}"
+        )
+        send_alert(
+            user_id,
+            f"⚠️ Skipping trade for {symbol} — 5x leverage/intraday not supported (Leverage: {leverage_res.get('leverage', 0.0):.1f}x)."
+        )
+        return
 
     # Step 5 — Place entry order (or simulate in paper mode)
     is_paper = Config.PAPER_TRADING_MODE or (bot.engine.mode == 'TEST')
@@ -1295,6 +1511,8 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
             'paper_trade': is_paper,
             'atr_14': l3_signal.get('atr_14', 0),
             'market_condition': 'TRENDING',
+            'discovery_score': decision.get('discovery_score'),
+            'discovery_rank': decision.get('discovery_rank')
         }
     )
     bot.tm.active_trades[-1]['instrument_token'] = symbol_key
@@ -1714,16 +1932,24 @@ def api_get_trade_history(user: dict = Depends(require_auth), db=Depends(get_db)
         
     latest_trade_date = trade_dates[0]
     
-    # Determine if we have crossed 9:00 AM on a new weekday trading day.
-    # If yes, we reset (show today's empty history). Otherwise, show latest day's history.
     now = get_ist_now()
     today = now.date()
-    is_weekday = now.weekday() < 5 # Mon-Fri
     
-    show_today_empty = False
-    if is_weekday and now.time() >= time(9, 0):
-        if today > latest_trade_date:
-            show_today_empty = True
+    # Logic: Show latest_trade_date ONLY IF:
+    # 1. Trade happened today
+    # 2. OR Trade happened yesterday (or Friday if today is Monday), AND it is before 9:00 AM.
+    # Otherwise, show an empty history for today.
+    
+    show_today_empty = True
+    days_diff = (today - latest_trade_date).days
+    
+    if today == latest_trade_date:
+        show_today_empty = False
+    elif days_diff == 1 and now.time() < time(9, 0):
+        show_today_empty = False
+    elif days_diff <= 3 and now.weekday() == 0 and latest_trade_date.weekday() == 4 and now.time() < time(9, 0):
+        # Today is Monday, last trade was Friday, and it's before 9:00 AM
+        show_today_empty = False
             
     if show_today_empty:
         db_trades = db.query(Trade).filter(Trade.user_id == uid, Trade.trade_date == today).all()
@@ -2131,7 +2357,7 @@ async def api_update_config(payload: dict, user: dict = Depends(require_auth), d
     if "MIN_CANDLE_STRENGTH" in payload: cfg.min_candle_strength = float(payload["MIN_CANDLE_STRENGTH"])
     if "MIN_STOCK_PRICE" in payload: cfg.min_stock_price = float(payload["MIN_STOCK_PRICE"])
     if "MAX_STOCK_PRICE" in payload: cfg.max_stock_price = float(payload["MAX_STOCK_PRICE"])
-    if "USE_GROQ_FILTER" in payload: cfg.use_groq_filter = 1 if payload["USE_GROQ_FILTER"] else 0
+    if "USE_CLAUDE_FILTER" in payload: cfg.use_claude_filter = 1 if payload["USE_CLAUDE_FILTER"] else 0
     if "USE_LIVE_CAPITAL" in payload: cfg.use_live_capital = 1 if payload["USE_LIVE_CAPITAL"] else 0
     if "HYBRID_VIRTUAL_MODE" in payload: cfg.hybrid_virtual_mode = 1 if payload["HYBRID_VIRTUAL_MODE"] else 0
     if "MANUAL_CAPITAL" in payload: cfg.manual_capital = float(payload["MANUAL_CAPITAL"])
@@ -2198,7 +2424,7 @@ def get_user_config_dict(db, user_id: int) -> dict:
         "MIN_CANDLE_STRENGTH": cfg.min_candle_strength,
         "MIN_STOCK_PRICE": cfg.min_stock_price,
         "MAX_STOCK_PRICE": cfg.max_stock_price,
-        "USE_GROQ_FILTER": bool(cfg.use_groq_filter),
+        "USE_CLAUDE_FILTER": bool(cfg.use_claude_filter),
         "USE_LIVE_CAPITAL": bool(cfg.use_live_capital),
         "HYBRID_VIRTUAL_MODE": getattr(cfg, 'hybrid_virtual_mode', 1) == 1,
         "MANUAL_CAPITAL": cfg.manual_capital,

@@ -19,7 +19,7 @@ cd /home/ubuntu/intradayBot
 echo "Starting bot with nohup..."
 
 # Write logs to project directory (not home dir)
-nohup /home/ubuntu/intradayBot/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 > /home/ubuntu/intradayBot/bot.log 2>&1 &
+nohup /home/ubuntu/intradayBot/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 >> /home/ubuntu/intradayBot/bot.log 2>&1 &
 
 sleep 5
 echo "=== BOT STATUS ==="

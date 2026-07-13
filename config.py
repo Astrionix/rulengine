@@ -40,13 +40,14 @@ class Config:
     DAILY_LOSS_LIMIT = 1000.0  # Max loss in ₹ before kill-switch
     TRAILING_SL_ACTIVATION = 1.0  # R-Multiple to start trailing
     MAX_OPEN_TRADES = 2
+    MAX_POSITION_PCT = 0.10  # Maximum 10% of capital allocated to any single trade during pilot
     CAPITAL = 100000.0  # (LEGACY, kept for minor fallback)
     USE_LIVE_CAPITAL = False
     MANUAL_CAPITAL = 100000.0
     
     # AI/ML Configuration
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-    USE_GROQ_FILTER = True
+    USE_CLAUDE_FILTER = True
     SCORE_THRESHOLD = 4
     SCORE_THRESHOLD_MIN = 3 # Minimum score for a trade
     PROBABILITY_THRESHOLD = 0.65  # Ignored when GROQ is active
@@ -100,8 +101,8 @@ class Config:
 
     # ── AI / LLM Configuration ────────────────────────────────────────────────
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-    ANTHROPIC_MODEL   = "claude-sonnet-4-6"
-    ANTHROPIC_MAX_TOKENS = 2000
+    ANTHROPIC_MODEL   = "claude-sonnet-5"
+    ANTHROPIC_MAX_TOKENS = 4000
     ANTHROPIC_TEMPERATURE = 0.0
 
     # ── Telegram Alerting ─────────────────────────────────────────────────────
