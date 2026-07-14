@@ -141,8 +141,26 @@ class SignalScanner:
             if result:
                 qualifying.append(result)
 
-        # Cap at top 5, ranked by conditions met (desc), then by vol_ratio (desc)
-        qualifying.sort(key=lambda x: (x["conditions_met"], x.get("vol_ratio_6bar", 0)), reverse=True)
+        # ── IMPROVEMENT 6: Sector-weighted ranking ────────────────────────────
+        # Boost signals from outperforming sectors so they rank higher when
+        # conditions_met is tied. Boost is capped at ±2 to avoid overriding
+        # strong signals from weaker sectors.
+        from nifty500_instruments import get_sector
+        for sig in qualifying:
+            sym_sector = get_sector(sig["symbol"])
+            sector_chg = self._sector_perf.get(sym_sector, 0.0)
+            # Normalize: 1% outperformance → +1 boost point (capped ±2)
+            sig["sector_boost"] = round(max(-2.0, min(2.0, sector_chg)), 2)
+
+        # Composite rank: conditions (primary) > sector_boost (secondary) > vol_ratio (tertiary)
+        qualifying.sort(
+            key=lambda x: (
+                x["conditions_met"],
+                x.get("sector_boost", 0.0),
+                x.get("vol_ratio_6bar", 0),
+            ),
+            reverse=True,
+        )
         top_signals = qualifying[:Config.LAYER4_MAX_STOCKS_PER_CYCLE]
 
         if top_signals:
@@ -281,7 +299,7 @@ class SignalScanner:
 
             # ── IMPROVEMENT 3: Multi-timeframe 15-minute alignment check ────
             if not self._check_15min_alignment(instrument_key, direction, engine):
-                logger.info(
+                logger.debug(
                     f"[Layer 3] {symbol} {direction} passed 5-min ({conditions_met}/5) "
                     f"but FAILED 15-min alignment check — skipped."
                 )
@@ -293,13 +311,13 @@ class SignalScanner:
             if sector and sector in self._sector_perf:
                 sector_chg = self._sector_perf[sector]
                 if direction == "LONG" and sector_chg < -0.3:
-                    logger.info(
+                    logger.debug(
                         f"[Layer 3] {symbol} LONG skipped — sector '{sector}' "
                         f"is down {sector_chg:.2f}% (against trade)."
                     )
                     return None
                 elif direction == "SHORT" and sector_chg > 0.3:
-                    logger.info(
+                    logger.debug(
                         f"[Layer 3] {symbol} SHORT skipped — sector '{sector}' "
                         f"is up {sector_chg:.2f}% (against trade)."
                     )

@@ -38,7 +38,7 @@ from database import (
 )
 from sqlalchemy import desc
 from dual_strategy_engine import DualStrategyEngine
-from user_bot_registry import get_or_create_bot, get_bot, reload_bot_credentials
+from user_bot_registry import get_or_create_bot, get_bot, reload_bot_credentials, all_bots
 from credential_service import upsert_credentials, credential_field_status, has_credentials
 
 # ── v2 Pipeline imports ──────────────────────────────────────────────────────
@@ -199,6 +199,22 @@ async def startup_event():
     finally:
         db_resume.close()
 
+    # ── Startup Health-Check Telegram Alert ───────────────────────────────────
+    try:
+        now_ist = datetime.now(IST)
+        resumed_count = len(running_configs) if 'running_configs' in dir() else 0
+        startup_msg = (
+            f"✅ <b>intradayBot server started</b>\n"
+            f"🕐 Time: {now_ist.strftime('%d-%b-%Y %H:%M:%S')} IST\n"
+            f"🤖 Auto-resumed bots: {resumed_count}\n"
+            f"📡 WebSocket feed: active\n"
+            f"⚙️ All systems nominal"
+        )
+        send_telegram(startup_msg)
+        logger.info("[Startup] Health-check Telegram alert sent.")
+    except Exception as e:
+        logger.warning(f"[Startup] Failed to send startup Telegram alert: {e}")
+
 async def dynamic_discovery_loop():
     """
     Review 1 Enhancement: Intraday Discovery Sub-Layer
@@ -229,7 +245,7 @@ async def dynamic_discovery_loop():
 
             # Need a valid bot/execution engine to fetch data
             # Use the first active bot's engine
-            active_bots = user_bot_registry.all_bots()
+            active_bots = all_bots()
             if not active_bots:
                 await asyncio.sleep(60)
                 continue

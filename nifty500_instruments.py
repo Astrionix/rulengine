@@ -90,7 +90,7 @@ SECTOR_MAP = {
     "INDIGO": "Aviation",
     
     # Others / Diversified
-    "AU SMALL": "Banking",
+    "AUBANK": "Banking",
     "M&M": "Auto",
 }
 

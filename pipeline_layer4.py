@@ -216,7 +216,7 @@ class FeatureExtractor:
             if dist < min_sl_dist:
                 calculated_sl = calculated_entry - atr_14
             elif dist > max_sl_dist:
-                logger.info(f"[Layer 4] {signal['symbol']} skipped — SL distance ({dist/calculated_entry*100:.2f}%) exceeds 1.5 ATR limit.")
+                logger.debug(f"[Layer 4] {signal['symbol']} skipped — SL distance ({dist/calculated_entry*100:.2f}%) exceeds 1.5 ATR limit.")
                 return None
             else:
                 calculated_sl = base_sl
@@ -229,7 +229,7 @@ class FeatureExtractor:
                 if vol_ratio_6bar > 3.0 and volume_trend == "expanding":
                     calculated_target = min(calculated_target, resistance_20bar * 1.005)
                 else:
-                    logger.info(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds resistance ({resistance_20bar:.2f}) without volume breakout.")
+                    logger.debug(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds resistance ({resistance_20bar:.2f}) without volume breakout.")
                     return None
                     
         else:  # SHORT
@@ -250,7 +250,7 @@ class FeatureExtractor:
                 if vol_ratio_6bar > 3.0 and volume_trend == "expanding":
                     calculated_target = max(calculated_target, support_20bar * 0.995)
                 else:
-                    logger.info(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds support ({support_20bar:.2f}) without volume breakdown.")
+                    logger.debug(f"[Layer 4] {signal['symbol']} skipped — target ({calculated_target:.2f}) exceeds support ({support_20bar:.2f}) without volume breakdown.")
                     return None
 
         # ── Market Context ────────────────────────────────────────────────
@@ -358,32 +358,55 @@ class FeatureExtractor:
         }
 
     def _get_cached_candles(self, instrument_key: str) -> pd.DataFrame:
-        """Get candles from rolling cache, refreshing every CANDLE_CACHE_REFRESH_MIN minutes."""
+        """Get candles from rolling cache, refreshing every CANDLE_CACHE_REFRESH_MIN minutes.
+        
+        TTL guard: if the cache entry was written on a different calendar date (e.g. bot ran
+        overnight), it is invalidated immediately to prevent yesterday's candles being used.
+        """
         now = _time.time()
+        today_date = datetime.now(IST).date()
         cache_entry = self._candle_cache.get(instrument_key)
         refresh_interval = Config.CANDLE_CACHE_REFRESH_MIN * 60
 
-        if cache_entry and (now - cache_entry["last_refresh"]) < refresh_interval:
-            return cache_entry["df"]
+        if cache_entry:
+            # Cross-day staleness check
+            cache_date = cache_entry.get("trade_date")
+            if cache_date and cache_date != today_date:
+                logger.debug(f"[Layer 4] Cache for {instrument_key} is from {cache_date} — invalidating (cross-day TTL).")
+                del self._candle_cache[instrument_key]
+                cache_entry = None
+            elif (now - cache_entry["last_refresh"]) < refresh_interval:
+                return cache_entry["df"]
 
         # Refresh
         df = self.engine.get_ohlc(instrument_key, interval="5minute")
         if not df.empty:
-            self._candle_cache[instrument_key] = {"df": df, "last_refresh": now}
+            self._candle_cache[instrument_key] = {"df": df, "last_refresh": now, "trade_date": today_date}
         return df
 
     def _get_cached_daily_candles(self, instrument_key: str, days: int = 45) -> pd.DataFrame:
-        """Get daily candles from cache, refreshing every 4 hours."""
+        """Get daily candles from cache, refreshing every 4 hours.
+        
+        TTL guard: cross-day check ensures overnight restarts don't reuse the
+        previous session's daily data.
+        """
         now = _time.time()
+        today_date = datetime.now(IST).date()
         cache_entry = self._daily_cache.get(instrument_key)
         refresh_interval = 4 * 3600  # 4 hours
-        
-        if cache_entry and (now - cache_entry["last_refresh"]) < refresh_interval:
-            return cache_entry["df"]
+
+        if cache_entry:
+            cache_date = cache_entry.get("trade_date")
+            if cache_date and cache_date != today_date:
+                logger.debug(f"[Layer 4] Daily cache for {instrument_key} is from {cache_date} — invalidating (cross-day TTL).")
+                del self._daily_cache[instrument_key]
+                cache_entry = None
+            elif (now - cache_entry["last_refresh"]) < refresh_interval:
+                return cache_entry["df"]
             
         df = self.engine.get_historical_candles_daily(instrument_key, days=days)
         if not df.empty:
-            self._daily_cache[instrument_key] = {"df": df, "last_refresh": now}
+            self._daily_cache[instrument_key] = {"df": df, "last_refresh": now, "trade_date": today_date}
         return df
 
     def _refresh_market_context(self, indices_cache: dict, prev_close_cache: dict = None):

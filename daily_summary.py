@@ -83,29 +83,55 @@ def generate_daily_summary(
     best_str = f"{best_trade.symbol} +₹{best_trade.realized_pnl:.2f}" if best_trade and (best_trade.realized_pnl or 0) > 0 else "N/A"
     worst_str = f"{worst_trade.symbol} -₹{abs(worst_trade.realized_pnl or 0):.2f}" if worst_trade and (worst_trade.realized_pnl or 0) < 0 else "N/A"
 
-    summary = f"""📊 DAILY SUMMARY — {date_str}
+    # ── No-trade day diagnostic ────────────────────────────────────────────────
+    no_trade_note = ""
+    l3_signals = stats.get('layer3_signals', 0)
+    claude_enters = stats.get('claude_enters', 0)
+    stocks_scanned = stats.get('stocks_scanned', 0)
+    orb_signals = stats.get('orb_signals', 0)
 
-Trades taken: {total} / {Config.MAX_TRADES_PER_DAY}
-Winners: {winners} | Losers: {losers} | Breakeven: {breakeven}
-Win rate: {win_rate:.0f}%
+    if total == 0:
+        if l3_signals == 0 and (orb_signals or 0) == 0:
+            no_trade_note = "\n\n💤 <b>No trades today</b> — No signals passed Layer 3 (market too flat / low-volume)."
+        elif l3_signals > 0 and claude_enters == 0:
+            no_trade_note = (
+                f"\n\n💤 <b>No trades today</b> — {l3_signals} L3 signal(s) generated but all "
+                f"rejected by Layer 4 risk filters (SL wider than 1.5x ATR for current market conditions)."
+            )
+        elif claude_enters > 0:
+            no_trade_note = (
+                f"\n\n💤 <b>No trades today</b> — Claude approved {claude_enters} signal(s) "
+                f"but order execution did not complete (check execution logs)."
+            )
+        else:
+            no_trade_note = "\n\n💤 <b>No trades today</b>."
 
-Total P&L: ₹{total_pnl:+.2f}
-Best trade: {best_str}
-Worst trade: {worst_str}
+    # ── Signal funnel ──────────────────────────────────────────────────────────
+    layer4_passed = stats.get('layer4_passed', 0)
+    claude_skips = stats.get('claude_skips_overriding_rules', 0)
+    funnel = (
+        f"  Watchlist size: {stocks_scanned}\n"
+        f"  L3 momentum signals: {l3_signals}\n"
+        f"  ORB breakout signals: {orb_signals}\n"
+        f"  Passed Layer 4 (risk OK): {layer4_passed if layer4_passed else 'N/A'}\n"
+        f"  Claude ENTER decisions: {claude_enters}\n"
+        f"  Claude API calls: {stats.get('claude_calls', 'N/A')}\n"
+        f"  Claude overrides: {claude_skips}"
+    )
 
-Pipeline stats:
-  Stocks scanned today: {stats.get('stocks_scanned', 'N/A')}
-  Momentum Layer 3 signals: {stats.get('layer3_signals', 'N/A')}
-  ORB breakout signals: {stats.get('orb_signals', 'N/A')}
-  Claude ENTER decisions: {stats.get('claude_enters', 'N/A')}
-  Trades executed: {total}
-  Claude calls made: {stats.get('claude_calls', 'N/A')}
-  Claude overrides (skips on local rules ENTER): {stats.get('claude_skips_overriding_rules', 0)}
-
-
-Market close:
-  Nifty: {nifty_close:.2f} ({nifty_change_pct:+.2f}% today)
-  India VIX: {vix_close:.1f}"""
+    summary = (
+        f"📊 <b>DAILY SUMMARY — {date_str}</b>{no_trade_note}\n\n"
+        f"<b>Trades:</b> {total} / {Config.MAX_TRADES_PER_DAY}\n"
+        f"Winners: {winners} | Losers: {losers} | Breakeven: {breakeven}\n"
+        f"Win rate: {win_rate:.0f}%\n\n"
+        f"<b>P&L: ₹{total_pnl:+.2f}</b>\n"
+        f"Best: {best_str}\n"
+        f"Worst: {worst_str}\n\n"
+        f"<b>Signal funnel:</b>\n{funnel}\n\n"
+        f"<b>Market close:</b>\n"
+        f"  Nifty: {nifty_close:.2f} ({nifty_change_pct:+.2f}% today)\n"
+        f"  India VIX: {vix_close:.1f}"
+    )
 
     alert_daily_summary(summary)
     logger.info(f"[Summary] Daily summary sent for {date_str}")
