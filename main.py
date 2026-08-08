@@ -635,7 +635,7 @@ async def user_trading_cycle(user_id: int):
     Per-user trading cycle — v2 pipeline-based.
     Runs as its own asyncio Task. Implements the full daily schedule (Section 7).
     """
-    global _signal_log, _pipeline_stats, latest_signals
+    global _signal_log, _pipeline_stats, latest_signals, _signal_log_cleared_date
 
     from user_bot_registry import get_bot
     bot = get_bot(user_id)
@@ -742,7 +742,6 @@ async def user_trading_cycle(user_id: int):
         now = datetime.now(IST)
 
         # Clear previous day's signal log and daily pipeline stats at 9:15 AM on trading days
-        global _signal_log, _pipeline_stats, _signal_log_cleared_date
         if now.time() >= time(9, 15) and _signal_log_cleared_date != now.date():
             logger.info(f"[USER {user_id}] 9:15 AM reached. Clearing yesterday's live signal logs and daily pipeline stats.")
             _signal_log = []
@@ -1055,7 +1054,14 @@ async def user_trading_cycle(user_id: int):
                         "layer3_conditions_met": 5,
                         "price_context": {
                             "ltp": orb_sig["ltp"],
-                            "price_vs_vwap_pct": 0.0,
+                            # BUG FIX: compute real VWAP % instead of hardcoding 0.0.
+                            # Hardcoded 0.0 caused Claude's mandatory VWAP rule to always
+                            # fire for SHORT signals (0.0 >= 0 -> SKIP), wasting every API call.
+                            "price_vs_vwap_pct": round(
+                                (orb_sig["ltp"] - _shared_prices.get(orb_sig["symbol"], {}).get("vwap", 0.0))
+                                / _shared_prices.get(orb_sig["symbol"], {}).get("vwap", orb_sig["ltp"])
+                                * 100, 3
+                            ) if _shared_prices.get(orb_sig["symbol"], {}).get("vwap", 0.0) > 0 else 0.0,
                             "price_vs_ema20_daily_pct": 0.0,
                             "price_vs_20day_high_pct": 0.0,
                             "atr_14_5min": abs(orb_sig["orb_high"] - orb_sig["orb_low"]) / 3,
@@ -1096,13 +1102,30 @@ async def user_trading_cycle(user_id: int):
                                      "strategy": "ORB"},
                     }
                     use_ai = bot.config.get("USE_CLAUDE_FILTER", True)
-                    if use_ai:
+
+                    # ── Layer 4.5: Python Mandatory Pre-Filter ─────────────────────────
+                    # Run deterministic skip checks BEFORE calling Claude.
+                    # Signals that fail are rejected instantly in Python, saving API cost.
+                    from pipeline_layer4_5 import python_mandatory_filter
+                    orb_approved, orb_rejected = python_mandatory_filter([orb_payload])
+                    for rej in orb_rejected:
+                        logger.info(
+                            f"[USER {user_id}] [Pre-Filter] {rej['symbol']} {rej['direction']} "
+                            f"SKIPPED before Claude — {rej['reason']}"
+                        )
+                        _add_signal_log(
+                            f"[{now.strftime('%H:%M')}] {rej['symbol']} SKIPPED (Pre-Filter): {rej['reason']}"
+                        )
+
+                    if use_ai and orb_approved:
                         orb_decisions = layer5.analyze(
-                            [orb_payload],
+                            orb_approved,
                             nifty_trend=layer4.get_nifty_trend(),
                             nifty_change_pct=nifty_chg_pct,
                             vix_value=vix_ltp,
                         )
+                    elif not orb_approved:
+                        orb_decisions = []  # Pre-filter rejected all — no Claude call needed
                     else:
                         orb_decisions = [{
                             "symbol": orb_sig["symbol"],
@@ -1209,22 +1232,39 @@ async def user_trading_cycle(user_id: int):
                             # Check if Generative Filter is enabled
                             use_ai = bot.config.get("USE_CLAUDE_FILTER", True)
 
-                            if use_ai:
-                                # Layer 5: Claude analysis
+                            # ── Layer 4.5: Python Mandatory Pre-Filter ────────────────
+                            # Reject signals with deterministic mathematical failures
+                            # before sending to Claude. Saves API cost and latency.
+                            from pipeline_layer4_5 import python_mandatory_filter
+                            approved_payloads, rejected_payloads = python_mandatory_filter(feature_payloads)
+                            for rej in rejected_payloads:
+                                logger.info(
+                                    f"[USER {user_id}] [Pre-Filter] {rej['symbol']} {rej['direction']} "
+                                    f"SKIPPED before Claude -- {rej['reason']}"
+                                )
+                                _add_signal_log(
+                                    f"[{now.strftime('%H:%M')}] {rej['symbol']} SKIPPED (Pre-Filter): {rej['reason']}"
+                                )
+
+                            if use_ai and approved_payloads:
+                                # Layer 5: Claude analysis (only approved signals)
                                 nifty_trend = layer4.get_nifty_trend()
                                 nifty_change = layer4.get_nifty_change_pct()
                                 vix_val = layer4.get_vix_value()
 
                                 decisions = layer5.analyze(
-                                    feature_payloads,
+                                    approved_payloads,
                                     nifty_trend=nifty_trend,
                                     nifty_change_pct=nifty_change,
                                     vix_value=vix_val,
                                 )
                                 _pipeline_stats["claude_calls"] = layer5.api_calls_today
+                            elif not approved_payloads:
+                                decisions = []  # All rejected by pre-filter — no Claude call
+                                logger.info(f"[USER {user_id}] All signals rejected by pre-filter — skipping Claude call.")
                             else:
                                 logger.info(f"[USER {user_id}] Generative Filter disabled — running local rule analysis (bypassing Claude).")
-                                decisions = run_local_rule_analysis(feature_payloads)
+                                decisions = run_local_rule_analysis(approved_payloads)
 
                             # Log decisions
                             for d in decisions:
@@ -1318,6 +1358,10 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     confidence = int(decision.get("confidence", 0))
     reasoning = decision.get("reasoning", "")
 
+    if entry_price <= 0.0:
+        logger.warning(f"[USER {user_id}] Invalid entry price {entry_price} for {symbol}. Skipping.")
+        return
+
     # Map direction to side
     side = "BUY" if direction == "LONG" else "SELL"
     import instrument_resolver
@@ -1372,9 +1416,9 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
                 send_alert(user_id, f"⚠️ Sector concentration block: skipping {symbol} — already trading '{new_sector}' via {active['symbol']}.")
                 return
 
-    # Step 4 — Quantity calculation (Risk-based)
+    # Step 4 — Quantity calculation (Risk-based with Capital Cap)
     daily_loss_limit = bot.config.get('DAILY_LOSS_LIMIT', Config.DAILY_LOSS_LIMIT)
-    risk_per_trade = daily_loss_limit / max_trades
+    risk_per_trade = daily_loss_limit / max(max_trades, 1)
     sl_distance = abs(entry_price - stop_loss)
     
     if sl_distance <= 0.0:
@@ -1390,6 +1434,33 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     if quantity <= 0:
         logger.warning(f"[USER {user_id}] Quantity rounds to 0 for {symbol}. Skipping.")
         return
+
+    # Step 4.1 — Capital Cap (with 5x Intraday Leverage): ensure trade value stays within configured capital per slot.
+    # A very tight SL (small sl_distance) can inflate qty to absurd levels (e.g. YESBANK 5000 shares
+    # at ₹22.89 = ₹1.14L when manual capital is only ₹10k). Cap it hard.
+    # Since this is an intraday bot with 5x leverage, the buying power per slot is:
+    # (Capital / Max Open Trades) * 5
+    manual_capital = bot.config.get('MANUAL_CAPITAL', Config.MANUAL_CAPITAL)
+    max_open = bot.config.get('MAX_OPEN_TRADES', Config.MAX_OPEN_TRADES)
+    capital_per_trade = manual_capital / max(max_open, 1)
+    
+    # 5x intraday leverage multiplier
+    leverage_multiplier = 5.0
+    leveraged_capital_per_trade = capital_per_trade * leverage_multiplier
+    
+    max_qty_by_capital = math.floor(leveraged_capital_per_trade / entry_price)
+    if max_qty_by_capital <= 0:
+        logger.warning(
+            f"[USER {user_id}] Leveraged Capital per trade (Rs{leveraged_capital_per_trade:.0f}) insufficient for "
+            f"{symbol} at Rs{entry_price:.2f}. Skipping."
+        )
+        return
+    if quantity > max_qty_by_capital:
+        logger.info(
+            f"[USER {user_id}] Qty capped by leveraged capital: {quantity} -> {max_qty_by_capital} "
+            f"(leveraged_capital_per_trade=Rs{leveraged_capital_per_trade:.0f}, entry=Rs{entry_price:.2f}) for {symbol}"
+        )
+        quantity = max_qty_by_capital
 
     # Step 4.5 — IMPROVEMENT 4: VIX-based position sizing
     # Scale down position size as volatility rises to protect capital automatically.
@@ -1450,7 +1521,10 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
         filled_qty = quantity
         actual_entry = ltp
     else:
-        res = bot.engine.place_order_with_retry(symbol_key, side, quantity)
+        res = bot.engine.place_order_with_retry(
+            symbol_key, side, quantity,
+            order_type='LIMIT', price=round(entry_price, 2)
+        )
         
         is_virtual = False
         if res.get('status') == 'unknown':
@@ -1494,22 +1568,29 @@ async def _execute_v2_trade(user_id: int, bot, decision: dict, layer3_signals: l
     # Step 6 — Place SL order
     sl_order_id = None
     if not is_paper:
-        # User requested: Force the SL order onto the Upstox API even for virtual trades so they appear in logs.
-        sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
-        if sl_res.get('status') != 'success':
-            if is_virtual:
-                # If virtual, we EXPECT Upstox to reject it because we have no position. Ignore rejection.
-                import uuid
-                sl_order_id = sl_res.get('order_id') or f"virtual_sl_{symbol}_{str(uuid.uuid4())[:6]}"
-            else:
+        if is_virtual:
+            # BUG FIX: Virtual trades must NEVER contact Upstox for SL placement.
+            # Placing an SL on Upstox when there's no real position causes Upstox
+            # to return a rejected-but-real order ID, which then corrupts the
+            # is_virtual_sl check in close_trade() and triggers a real square-off
+            # order at 3:15 PM. Always use a clearly-named virtual SL ID instead.
+            import uuid
+            sl_order_id = f"virtual_sl_{symbol}_{str(uuid.uuid4())[:6]}"
+            logger.info(f"[USER {user_id}] Virtual trade — skipping Upstox SL placement. Assigned virtual SL ID: {sl_order_id}")
+        else:
+            sl_res = bot.engine.place_stop_loss(symbol_key, side, filled_qty, stop_loss)
+            if sl_res.get('status') != 'success':
                 send_alert(user_id, f"SL order placement failed for {symbol}. Emergency square-off!")
                 counter_side = "SELL" if side == "BUY" else "BUY"
-                exit_res = bot.engine.place_order_with_retry(symbol_key, counter_side, filled_qty)
+                exit_res = bot.engine.place_order_with_retry(
+                    symbol_key, counter_side, filled_qty,
+                    order_type='MARKET'
+                )
                 if exit_res.get('status') != 'success':
                     send_alert(user_id, f"FATAL: Emergency square-off failed for {symbol}! Manual intervention required!")
                 return
-        else:
-            sl_order_id = sl_res.get('order_id')
+            else:
+                sl_order_id = sl_res.get('order_id')
  
     # Step 7 — Persist to database
     bot.tm.add_trade(
@@ -2586,7 +2667,7 @@ async def api_update_sl_path(
 async def dual_start(body: dict, user: dict = Depends(require_auth), db=Depends(get_db)):
     uid = user["uid"]
     bot = get_or_create_bot(uid, db)
-    return await bot.dual.start(body)
+    return bot.dual.start(body)
 
 @app.post("/api/dual/stop")
 async def dual_stop(user: dict = Depends(require_auth), db=Depends(get_db)):

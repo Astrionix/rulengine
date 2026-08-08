@@ -147,13 +147,24 @@ class OpeningRangeBreakout:
                 if not orb_candles.empty:
                     highest = orb_candles['high'].max()
                     lowest = orb_candles['low'].min()
+                    or_low = float(lowest)
+                    or_high = float(highest)
+                    or_range_pct = ((or_high - or_low) / or_low * 100) if or_low > 0 else 0.0
+                    
+                    if or_range_pct > ORB_MAX_RANGE_PCT:
+                        logger.info(f"[ORB] Recovered range for {symbol} ({or_range_pct:.1f}%) is too wide (> {ORB_MAX_RANGE_PCT}%). Skipping.")
+                        continue
+                    elif or_range_pct < ORB_MIN_RANGE_PCT:
+                        logger.info(f"[ORB] Recovered range for {symbol} ({or_range_pct:.1f}%) is too narrow (< {ORB_MIN_RANGE_PCT}%). Skipping.")
+                        continue
+                        
                     self._ranges[symbol] = {
-                        "high": float(highest),
-                        "low": float(lowest),
+                        "high": or_high,
+                        "low": or_low,
                         "obs_count": len(orb_candles)
                     }
                     recovered_count += 1
-                    logger.info(f"[ORB] Recovered range for {symbol}: H={highest:.2f}/L={lowest:.2f} using {len(orb_candles)} candles")
+                    logger.info(f"[ORB] Recovered valid range for {symbol}: H={highest:.2f}/L={lowest:.2f} ({or_range_pct:.1f}%) using {len(orb_candles)} candles")
             except Exception as re:
                 logger.error(f"[ORB] Failed to recover range for {symbol}: {re}")
                 
@@ -269,15 +280,33 @@ class OpeningRangeBreakout:
             or_high = orb["high"]
             or_low  = orb["low"]
             or_range = or_high - or_low
+            or_range_pct = ((or_high - or_low) / or_low * 100) if or_low > 0 else 0.0
 
             ltp = prices_cache.get(symbol, 0.0)
             if ltp <= 0:
                 continue
 
-            # Determine if a breakout has occurred (use completed 1-min candle close to avoid wick rejections - Fix 6)
-            last_1min_close = self._get_last_1min_close(instrument_key, engine)
-            if last_1min_close <= 0.0:
-                last_1min_close = ltp  # fallback to LTP if data fetch failed
+            # Proximity pre-filter to avoid hitting Upstox API rate limits:
+            # Skip if LTP is deep inside the opening range. A breakout can only be triggered
+            # when the price is near or outside the range boundaries.
+            is_near_high = ltp > or_high * 0.9985  # within 0.15% of high or above
+            is_near_low  = ltp < or_low * 1.0015   # within 0.15% of low or below
+            if not (is_near_high or is_near_low):
+                continue
+
+            # Fetch 1-minute historical candles to verify completed candle close breakout
+            # (use completed 1-min candle close to avoid wick rejections - Fix 6)
+            try:
+                df_1min = engine.get_ohlc(instrument_key, interval="1minute")
+            except Exception as e:
+                logger.warning(f"[ORB] Failed to fetch 1-min candles for {symbol}: {e}")
+                continue
+
+            if df_1min is None or df_1min.empty or len(df_1min) < 22:
+                continue
+
+            # Index -2 is the last fully completed closed 1-minute candle
+            last_1min_close = float(df_1min.iloc[-2]['close'])
                 
             breakout_long  = last_1min_close > or_high * 1.001   # close 0.1% above ORB high
             breakout_short = last_1min_close < or_low  * 0.999   # close 0.1% below ORB low
@@ -302,8 +331,13 @@ class OpeningRangeBreakout:
                 )
                 continue
 
-            # Volume confirmation using 20-bar average
-            vol_ratio = self._get_vol_ratio_20bar(instrument_key, engine)
+            # Volume confirmation using 20-bar average on 1-minute chart
+            # Index -2 is the completed breakout candle on the 1-minute chart
+            vol_current = float(df_1min.iloc[-2]['volume'])
+            # 20-bar average of completed 1-minute candles prior to the breakout
+            vol_avg = df_1min['volume'].iloc[-22:-2].mean()
+            vol_ratio = vol_current / vol_avg if vol_avg > 0 else 0.0
+
             if vol_ratio < ORB_MIN_VOL_RATIO:
                 logger.info(
                     f"[ORB] {symbol} {direction}: volume {vol_ratio:.1f}x < "
@@ -380,31 +414,3 @@ class OpeningRangeBreakout:
             )
 
         return signals
-
-    def _get_vol_ratio_20bar(self, instrument_key: str, engine) -> float:
-        """
-        Compute breakout candle volume vs 20-bar rolling average.
-        Uses 5-minute candles (each bar = 5 minutes).
-        """
-        try:
-            df = engine.get_ohlc(instrument_key, interval="5minute")
-            if df is None or df.empty or len(df) < 3:
-                return 0.0
-            vol_current = float(df.iloc[-1]['volume'])
-            lookback = min(20, len(df) - 1)
-            vol_avg  = df['volume'].iloc[-lookback-1:-1].mean()
-            return vol_current / vol_avg if vol_avg > 0 else 0.0
-        except Exception as e:
-            logger.warning(f"[ORB] Volume check failed for {instrument_key}: {e}")
-            return 0.0
-
-    def _get_last_1min_close(self, instrument_key: str, engine) -> float:
-        """Fetch the close price of the last completed 1-minute candle."""
-        try:
-            df = engine.get_ohlc(instrument_key, interval="1minute")
-            if df is not None and not df.empty and len(df) >= 2:
-                # index -2 is the last fully completed closed 1-minute candle
-                return float(df.iloc[-2]['close'])
-        except Exception as e:
-            logger.warning(f"[ORB] Failed to fetch 1-min candle close for {instrument_key}: {e}")
-        return 0.0

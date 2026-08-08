@@ -66,6 +66,7 @@ class TradeManager:
                         'sl': t.sl_price,
                         'initial_sl': t.sl_price,
                         'target': t.target_price,
+                        'target_hit': (t.target_price is None or t.target_price == 0.0),
                         'probability': 0.0,
                         'score': t.ai_score or 0.0,
                         'pnl': 0.0,
@@ -135,6 +136,7 @@ class TradeManager:
             'sl': sl,
             'initial_sl': sl,
             'target': target,
+            'target_hit': False,
             'probability': probability,
             'score': score,
             'pnl': 0.0,
@@ -325,11 +327,11 @@ class TradeManager:
         if trade['side'] == 'BUY':
             if price <= sl:
                 exit_trade = True
-                exit_reason = "SL Hit"
+                exit_reason = "Trailing SL Hit" if trade.get('target_hit') else "SL Hit"
         elif trade['side'] == 'SELL':
             if price >= sl:
                 exit_trade = True
-                exit_reason = "SL Hit"
+                exit_reason = "Trailing SL Hit" if trade.get('target_hit') else "SL Hit"
                 
         # Also check time >= 3:15 PM
         now = get_ist_now()
@@ -397,45 +399,100 @@ class TradeManager:
         if 'breakeven_triggered' not in trade:
             trade['breakeven_triggered'] = False
 
+        if 'target_hit' not in trade:
+            trade['target_hit'] = (trade.get('target') is None or trade.get('target') == 0.0)
+
         new_sl = trade['sl']
         
-        # 1. 2-stage trailing calculation
-        if side == 'BUY':
-            # Stage 1: Breakeven (Regime-adaptive R-multiple)
-            if not trade['breakeven_triggered'] and price >= entry + trigger_offset:
-                new_sl = entry + (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
-                trade['breakeven_triggered'] = True
-                logger.info(
-                    f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
-                    f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
-                    f"regime={active_regime} ({regime_str})"
-                )
-            
-            # Stage 2: Active Trailing (+2x ATR)
-            if price >= entry + 2 * atr_14:
-                candidate_sl = price - atr_14
-                # Only move SL up
+        # Check target hit
+        target = trade.get('target')
+        if not trade['target_hit'] and target and target > 0.0:
+            target_reached = False
+            if side == 'BUY' and price >= target:
+                target_reached = True
+            elif side == 'SELL' and price <= target:
+                target_reached = True
+                
+            if target_reached:
+                trade['target_hit'] = True
+                new_sl = target
+                trade['target'] = None
+                
+                # Update DB to clear target and set SL to target price
+                db = SessionLocal()
+                try:
+                    db_trade = db.query(Trade).filter(Trade.id == trade['id']).first()
+                    if db_trade:
+                        db_trade.target_price = None
+                        db_trade.sl_price = target
+                        db.commit()
+                        logger.info(f"DB updated: trade {trade['symbol']} target cleared and SL set to target {target}.")
+                except Exception as db_err:
+                    db.rollback()
+                    logger.error(f"Failed to clear target / update SL in DB: {db_err}")
+                finally:
+                    db.close()
+                    
+                logger.info(f"🎯 Target hit for {trade['symbol']} @ {price}! Setting SL to target price {target} and initiating aggressive trailing.")
+                try:
+                    from telegram_alert import send_telegram
+                    send_telegram(f"🎯 **Target Hit for {trade['symbol']}**!\n"
+                                  f"LTP: ₹{price:.2f}\n"
+                                  f"Target: ₹{target:.2f} is now the new Stop Loss.\n"
+                                  f"Switching to Aggressive Trailing Stop Loss.")
+                except Exception as ta_err:
+                    logger.error(f"Failed to send target hit alert: {ta_err}")
+
+        # 1. 2-stage trailing calculation OR Aggressive Trailing if target was hit
+        if trade['target_hit']:
+            # Aggressive Trailing (LTP +/- 0.4x ATR)
+            if side == 'BUY':
+                candidate_sl = price - 0.4 * atr_14
                 if candidate_sl > new_sl:
                     new_sl = candidate_sl
-                    logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
-        else: # SELL
-            # Stage 1: Breakeven (Regime-adaptive R-multiple)
-            if not trade['breakeven_triggered'] and price <= entry - trigger_offset:
-                new_sl = entry - (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
-                trade['breakeven_triggered'] = True
-                logger.info(
-                    f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
-                    f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
-                    f"regime={active_regime} ({regime_str})"
-                )
-            
-            # Stage 2: Active Trailing (+2x ATR)
-            if price <= entry - 2 * atr_14:
-                candidate_sl = price + atr_14
-                # Only move SL down
+                    logger.info(f"Trailing SL (Aggressive): {trade['symbol']} @ {new_sl} (LTP={price})")
+            else: # SELL
+                candidate_sl = price + 0.4 * atr_14
                 if candidate_sl < new_sl:
                     new_sl = candidate_sl
-                    logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
+                    logger.info(f"Trailing SL (Aggressive): {trade['symbol']} @ {new_sl} (LTP={price})")
+        else:
+            if side == 'BUY':
+                # Stage 1: Breakeven (Regime-adaptive R-multiple)
+                if not trade['breakeven_triggered'] and price >= entry + trigger_offset:
+                    new_sl = entry + (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
+                    trade['breakeven_triggered'] = True
+                    logger.info(
+                        f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
+                        f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
+                        f"regime={active_regime} ({regime_str})"
+                    )
+                
+                # Stage 2: Active Trailing (+2x ATR)
+                if price >= entry + 2 * atr_14:
+                    candidate_sl = price - atr_14
+                    # Only move SL up
+                    if candidate_sl > new_sl:
+                        new_sl = candidate_sl
+                        logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
+            else: # SELL
+                # Stage 1: Breakeven (Regime-adaptive R-multiple)
+                if not trade['breakeven_triggered'] and price <= entry - trigger_offset:
+                    new_sl = entry - (0.05 * atr_14)  # Fix 2: True zero-loss breakeven
+                    trade['breakeven_triggered'] = True
+                    logger.info(
+                        f"Trailing SL Stage 1: Breakeven triggered for {trade['symbol']}. "
+                        f"ATR={atr_14:.2f}, R-multiple={r_mult}, new_SL={new_sl:.2f}, "
+                        f"regime={active_regime} ({regime_str})"
+                    )
+                
+                # Stage 2: Active Trailing (+2x ATR)
+                if price <= entry - 2 * atr_14:
+                    candidate_sl = price + atr_14
+                    # Only move SL down
+                    if candidate_sl < new_sl:
+                        new_sl = candidate_sl
+                        logger.info(f"Trailing SL Stage 2: Active trailing for {trade['symbol']} @ {new_sl}")
 
         # Rounded to tick size (0.05)
         rounded_new_sl = round(new_sl * 20) / 20.0
@@ -574,33 +631,43 @@ class TradeManager:
         is_paper = trade.get('metadata', {}).get('paper_trade', False)
         
         if execution_engine and not is_paper:
-            # 1. Cancel pending SL order on Upstox (skip if SL Hit because it's already filled/completed)
-            if reason != "SL Hit" and sl_order_id and not str(sl_order_id).startswith("virtual_"):
-                try:
-                    logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
-                    execution_engine.cancel_order(sl_order_id)
-                except Exception as e:
-                    logger.error(f"Failed to cancel SL order {sl_order_id}: {e}")
-                    
-            # 2. Place actual market exit order so it logs in Upstox (skip if SL Hit on a real broker order, or emergency routine already exited)
-            is_virtual_sl = not sl_order_id or str(sl_order_id).startswith("virtual_")
-            skip_market_exit = False
-            
-            if reason == "EMERGENCY_SKIPPED_SL_EXIT":
-                skip_market_exit = True
-            elif reason == "SL Hit" and not is_virtual_sl:
-                # Broker already executed the real SL order
-                skip_market_exit = True
-                
-            if not skip_market_exit:
-                symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
-                if symbol_key:
-                    counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
-                    logger.info(f"Submitting square-off order to Upstox for {trade['symbol']} ({reason}, virtual_sl={is_virtual_sl})")
+            # BUG FIX 3: Check is_virtual from trade metadata FIRST.
+            # Previously, only is_virtual_sl (derived from SL order ID prefix) was checked.
+            # But if a rejected Upstox SL order returned a real-looking order ID (due to Bug 2),
+            # is_virtual_sl would be False for virtual trades, causing real square-off
+            # orders to be placed at 3:15 PM against non-existent positions.
+            is_virtual_trade = trade.get('metadata', {}).get('is_virtual', False)
+            if is_virtual_trade:
+                logger.info(f"Virtual trade close for {trade['symbol']} ({reason}) — skipping all Upstox order actions.")
+            else:
+                # 1. Cancel pending SL order on Upstox (skip if SL Hit because it's already filled/completed)
+                if reason != "SL Hit" and sl_order_id and not str(sl_order_id).startswith("virtual_"):
                     try:
-                        execution_engine.place_order_with_retry(symbol_key, counter_side, trade['qty'])
+                        logger.info(f"Canceling pending SL order {sl_order_id} for {trade['symbol']} due to trade close ({reason})")
+                        execution_engine.cancel_order(sl_order_id)
                     except Exception as e:
-                        logger.error(f"Failed to place exit order on broker: {e}")
+                        logger.error(f"Failed to cancel {sl_order_id}: {e}")
+
+                # 2. Place actual market exit order so it logs in Upstox
+                is_virtual_sl = not sl_order_id or str(sl_order_id).startswith("virtual_")
+                skip_market_exit = False
+
+                if reason == "EMERGENCY_SKIPPED_SL_EXIT":
+                    skip_market_exit = True
+                elif reason == "SL Hit" and not is_virtual_sl:
+                    # Broker already executed the real SL order
+                    skip_market_exit = True
+
+                if not skip_market_exit:
+                    symbol_key = trade.get('instrument_token') or Config.SYMBOLS_MAPPING.get(trade['symbol'])
+                    if symbol_key:
+                        counter_side = "SELL" if trade['side'] == "BUY" else "BUY"
+                        logger.info(f"Submitting square-off order to Upstox for {trade['symbol']} ({reason}, virtual_sl={is_virtual_sl})")
+                        try:
+                            execution_engine.place_order_with_retry(symbol_key, counter_side, trade['qty'], order_type='MARKET')
+                        except Exception as e:
+                            logger.error(f"Failed to place exit order on broker: {e}")
+
         
         # Consecutive Losses Tracking (Now isolated by TradeManager instance)
         if not hasattr(self, 'consecutive_losses'):

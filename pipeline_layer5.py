@@ -80,20 +80,19 @@ MARKET REGIME ADAPTATION (MANDATORY):
   (Note: Apply all rules that match the active flags in market_regime. E.g., if both TRENDING_DOWN and HIGH_VOLATILITY are present, require confidence 5 for ALL signals).
 
 MANDATORY SKIP conditions (return SKIP immediately, confidence is irrelevant):
+  NOTE: The following checks have already been run in Python before reaching you:
+    - VWAP direction check
+    - Support/Resistance proximity (< 0.3%)
+    - Volume contracting check
+    - VIX > 25 block
+    - BankNifty strong counter-trend (> 0.30%)
+  You still apply these as a secondary check, but do not be surprised if they are never triggered.
+
+  Remaining mandatory skips you must enforce:
   1. signal_direction does not match the clear price action. If data suggests LONG but
      signal_direction is SHORT (or vice versa), return SKIP with red_flag explanation.
      Never change direction — always return the direction matching signal_direction.
-  2. price_vs_vwap_pct is against the signal direction:
-     LONG + price_vs_vwap_pct <= 0 → SKIP (price is at or below VWAP for a LONG setup)
-     SHORT + price_vs_vwap_pct >= 0 → SKIP (price is at or above VWAP for a SHORT setup)
-  3. For LONG: distance_to_resistance_pct < 0.3% → SKIP (stock is against resistance)
-     For SHORT: distance_to_support_pct < 0.3% → SKIP (stock is against support)
-  4. Logical stop-loss would be wider than 1.5x ATR → SKIP (risk too large)
-  5. volume_trend is "contracting" AND vol_ratio_6bar_5min < 1.5 → SKIP (setup losing steam)
-  6. If the entry candle has a wick rejection greater than 35% of the total range in the 
-     direction against the trade (upper wick for LONG, lower wick for SHORT), return SKIP 
-     regardless of other factors.
-  7. If any of these fields are null, zero, or missing: atr_14_5min, support_20bar_5min, 
+  2. If any of these fields are null, zero, or missing: atr_14_5min, support_20bar_5min, 
      resistance_20bar_5min, ltp, cleared_previous_day_high, cleared_previous_day_low → return SKIP with red_flags: "incomplete data". 
      Never hallucinate or estimate missing structural values.
 
@@ -104,7 +103,6 @@ CONFIDENCE THRESHOLDS:
 
 VIX OVERLAY:
   india_vix > 18 → require confidence >= 4 to ENTER
-  india_vix > 25 → return SKIP for all stocks, red_flags: "extreme volatility — VIX above 25"
 
 TIME CONTEXT CONSTRAINTS:
   - If time_bucket is "AFTERNOON" (after 1:30 PM):
@@ -123,8 +121,8 @@ VOLUME DIVERGENCE FILTER:
 
 LEADING INDEX trend (BANK NIFTY - GAP 1):
   Evaluate bank_nifty_slope and bank_nifty_change_3bar_pct under market_context:
-  - For LONG: if bank_nifty_slope is "falling" AND bank_nifty_change_3bar_pct < -0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags. If bank_nifty_slope is "falling" AND bank_nifty_change_3bar_pct < -0.30% (strong drop) → return SKIP.
-  - For SHORT: if bank_nifty_slope is "rising" AND bank_nifty_change_3bar_pct > 0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags. If bank_nifty_slope is "rising" AND bank_nifty_change_3bar_pct > 0.30% (strong rise) → return SKIP.
+  - For LONG: if bank_nifty_slope is "falling" AND bank_nifty_change_3bar_pct < -0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags.
+  - For SHORT: if bank_nifty_slope is "rising" AND bank_nifty_change_3bar_pct > 0.15% → downgrade confidence by 1 and note "bank nifty counter-trend" in red_flags.
 
 PREVIOUS DAY HIGH/LOW CONFIRMATION (GAP 2):
   Evaluate cleared_previous_day_high and cleared_previous_day_low under levels:

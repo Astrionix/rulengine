@@ -33,7 +33,7 @@ class Config:
     UPSTOX_CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET", "2yoyfwa9e7")
     UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
     ANALYTICS_TOKEN = os.getenv("ANALYTICS_TOKEN", "")
-    REDIRECT_URI = os.getenv("REDIRECT_URI", "https://deepcodev.com/callback")
+    REDIRECT_URI = os.getenv("REDIRECT_URI", "https://bot.deepcodev.site/callback")
 
     MAX_TRADES_PER_DAY = 5
     MAX_DAILY_LOSS_PCT = -0.02  # (Legacy fallback)

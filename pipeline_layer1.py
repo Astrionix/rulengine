@@ -72,12 +72,10 @@ class MorningPreFilter:
             
             for item in scraped_stocks:
                 symbol = item["symbol"]
-                if symbol not in existing_symbols:
-                    key = Config.SYMBOLS_MAPPING.get(symbol.upper())
-                    if key:
+                if symbol in universe and symbol not in existing_symbols:
                         qualifying.append({
                             "symbol": symbol,
-                            "instrument_key": key,
+                        "instrument_key": universe[symbol],
                             "direction_bias": item["direction_bias"],
                             "vol_ratio_20day": None,
                             "relative_strength_5day": None,

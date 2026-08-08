@@ -4444,6 +4444,9 @@
                     const isProfit = pnl >= 0;
                     const isBuy = t.side === 'BUY';
 
+                    const targetVal = parseFloat(t.target);
+                    const targetDisplay = (isNaN(targetVal) || targetVal <= 0.0) ? '🎯 HIT' : `₹${targetVal.toFixed(2)}`;
+
                     html += `
             <div style="display: flex; flex-direction: column; gap: 8px; width: 100%; padding: 8px 0; border-bottom: 1px solid var(--border-light);">
                 <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
@@ -4478,7 +4481,7 @@
                         </div>
                         <div style="padding: 2px 4px; text-align: center;">
                             <div style="font-size: 6px; color: var(--muted); font-weight: 700; text-transform: uppercase; margin-bottom: 1px;">Target</div>
-                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono'; color: var(--green);">₹${parseFloat(t.target || 0).toFixed(2)}</div>
+                            <div style="font-size: 9px; font-weight: 700; font-family: 'JetBrains Mono'; color: var(--green);">${targetDisplay}</div>
                         </div>
                     </div>
                     <div style="display: flex; align-items: center; flex-shrink: 0; min-width: 70px; justify-content: flex-end;">

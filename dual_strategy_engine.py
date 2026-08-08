@@ -221,10 +221,11 @@ class DualStrategyEngine:
                                 if self.state["sl_order_id_B"]:
                                     self.ee.modify_order(
                                         order_id=self.state["sl_order_id_B"],
-                                        quantity=self.state["qty_B"],
-                                        price=0,
-                                        trigger_price=new_sl,
-                                        order_type="SL-M"
+                                        new_price=0.0,
+                                        new_trigger=new_sl,
+                                        qty=self.state["qty_B"],
+                                        order_type="SL",
+                                        transaction_type="BUY"
                                     )
 
                         # SL is theoretically managed by broker, but we do a local check too
