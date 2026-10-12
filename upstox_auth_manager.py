@@ -134,14 +134,17 @@ def update_system_token(access_token: str) -> bool:
 
     # 3. Update database credentials for all users
     try:
-        from database import get_db_session, UserCredential
+        from database import SessionLocal, UserCredential
         from credential_service import _safe_encrypt
-        with get_db_session() as db:
+        db = SessionLocal()
+        try:
             creds = db.query(UserCredential).all()
             for c in creds:
                 c.upstox_access_token = _safe_encrypt(access_token)
             db.commit()
             logger.info(f"Updated access token in database for {len(creds)} user credential row(s).")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"Database credential update skipped or failed: {e}")
 

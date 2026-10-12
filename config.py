@@ -4,8 +4,9 @@ import os
 import json
 
 # Native .env loader to securely pull keys without external packages
-if os.path.exists(".env"):
-    with open(".env", "r", encoding="utf-8") as f:
+env_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_file_path):
+    with open(env_file_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
