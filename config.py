@@ -31,6 +31,8 @@ class Config:
     # Upstox API Credentials
     UPSTOX_CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID", "6528658a-2ce9-44bc-8c70-1100c3b54651")
     UPSTOX_CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET", "2yoyfwa9e7")
+    UPSTOX_TOTP_SECRET = os.getenv("UPSTOX_TOTP_SECRET", "")
+    UPSTOX_USER_PIN = os.getenv("UPSTOX_USER_PIN", "")
     UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
     ANALYTICS_TOKEN = os.getenv("ANALYTICS_TOKEN", "")
     REDIRECT_URI = os.getenv("REDIRECT_URI", "https://bot.deepcodev.site/callback")

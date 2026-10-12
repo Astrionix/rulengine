@@ -797,6 +797,18 @@ async def user_trading_cycle(user_id: int):
                     name_to_ltp[sym_name] = _shared_prices[sym_key]
             bot.tm.update_prices(name_to_ltp, bot.engine)
 
+        # ── 08:50 AM — Automated TOTP Token Generation ────────────────────
+        if (now.hour == 8 and now.minute in (45, 50)) or not bot.engine.connect():
+            try:
+                from upstox_auth_manager import auto_refresh_and_apply
+                logger.info(f"[USER {user_id}] Checking / Refreshing Upstox Token via TOTP...")
+                res = auto_refresh_and_apply()
+                if res.get("status") == "success":
+                    reload_bot_credentials(user_id, _db())
+                    bot = get_bot(user_id)
+            except Exception as e:
+                logger.error(f"[USER {user_id}] Failed auto-refreshing Upstox token: {e}")
+
         # ── 08:55 AM — Token verification ─────────────────────────────────
         if now.hour == 8 and now.minute == 55:
             logger.info(f"[USER {user_id}] 8:55 AM — Verifying Upstox API token validity...")
@@ -2426,6 +2438,16 @@ async def api_emergency(user: dict = Depends(require_auth), db=Depends(get_db)):
 @app.get("/api/symbols")
 def api_get_symbols(user: dict = Depends(require_auth)):
     return Config.SYMBOLS_MAPPING
+
+@app.post("/api/auth/refresh-upstox")
+def api_refresh_upstox_token(user: dict = Depends(require_auth), db=Depends(get_db)):
+    """Generates a fresh Upstox access token using TOTP and applies it immediately."""
+    from upstox_auth_manager import auto_refresh_and_apply
+    from user_bot_registry import reload_bot_credentials
+    res = auto_refresh_and_apply()
+    if res.get("status") == "success":
+        reload_bot_credentials(user["uid"], db)
+    return res
 
 @app.get("/api/config")
 def api_get_config(user: dict = Depends(require_auth), db=Depends(get_db)):
