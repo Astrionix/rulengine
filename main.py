@@ -797,8 +797,8 @@ async def user_trading_cycle(user_id: int):
                     name_to_ltp[sym_name] = _shared_prices[sym_key]
             bot.tm.update_prices(name_to_ltp, bot.engine)
 
-        # ── 08:50 AM — Automated TOTP Token Generation ────────────────────
-        if (now.hour == 8 and now.minute in (45, 50)) or not bot.engine.connect():
+        # ── 08:00 AM+ — Automated TOTP Token Generation ────────────────────
+        if (now.hour == 8 and now.minute >= 0) or not bot.engine.connect():
             try:
                 from upstox_auth_manager import auto_refresh_and_apply
                 logger.info(f"[USER {user_id}] Checking / Refreshing Upstox Token via TOTP...")
