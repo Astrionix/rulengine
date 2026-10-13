@@ -319,16 +319,17 @@
     padding-bottom: calc(76px + var(--safe-bottom)) !important;
   }
 
-  /* ── Horizontal Swipeable Index Ticker ── */
+  /* ── Horizontal Swipeable Index Ticker (Bigger, Spacious Cards) ── */
   .index-banner {
     display: flex !important;
     flex-direction: row !important;
     overflow-x: auto !important;
     -webkit-overflow-scrolling: touch !important;
     scrollbar-width: none !important;
-    gap: 8px !important;
-    padding: 6px 2px !important;
-    margin-bottom: 12px !important;
+    gap: 12px !important;
+    padding: 10px 4px !important;
+    margin-bottom: 14px !important;
+    scroll-snap-type: x mandatory !important;
   }
 
   .index-banner::-webkit-scrollbar {
@@ -337,37 +338,52 @@
 
   .idx-item {
     flex: 0 0 auto !important;
+    scroll-snap-align: start !important;
     background: var(--glass-card-bg) !important;
-    backdrop-filter: blur(18px) !important;
-    -webkit-backdrop-filter: blur(18px) !important;
-    border: 1px solid var(--glass-card-border) !important;
-    border-radius: 14px !important;
-    padding: 8px 14px !important;
+    backdrop-filter: blur(20px) !important;
+    -webkit-backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+    border-radius: 16px !important;
+    padding: 14px 18px !important;
     display: flex !important;
     flex-direction: column !important;
     align-items: flex-start !important;
-    min-width: 114px !important;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25) !important;
+    min-width: 156px !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
+    transition: transform 0.2s ease, border-color 0.2s ease !important;
+  }
+
+  .idx-item:active {
+    transform: scale(0.97) !important;
   }
 
   .idx-name {
-    font-size: 10px !important;
-    font-weight: 700 !important;
-    color: var(--muted) !important;
-    letter-spacing: 0.5px !important;
-    margin-bottom: 2px !important;
+    font-size: 12px !important;
+    font-weight: 800 !important;
+    color: #94a3b8 !important;
+    letter-spacing: 0.8px !important;
+    text-transform: uppercase !important;
+    margin-bottom: 5px !important;
   }
 
   .idx-price {
-    font-size: 14px !important;
-    font-weight: 800 !important;
+    font-size: 19px !important;
+    font-weight: 900 !important;
     font-family: 'JetBrains Mono', monospace !important;
-    color: var(--text) !important;
+    color: #ffffff !important;
+    letter-spacing: -0.4px !important;
+    line-height: 1.2 !important;
   }
 
   .idx-chg {
-    font-size: 11px !important;
+    font-size: 13px !important;
     font-weight: 700 !important;
+    margin-top: 5px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    display: inline-block !important;
+    padding: 2px 7px !important;
+    border-radius: 6px !important;
+    background: rgba(255, 255, 255, 0.06) !important;
   }
 
   /* ── Stat Ribbon Cards ── */

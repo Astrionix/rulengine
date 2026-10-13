@@ -3072,16 +3072,18 @@
                 justify-content: center;
             }
 
-            /* ── Index Banner ── */
+            /* ── Index Banner (Enlarged, Spacious Cards) ── */
             .index-banner {
                 position: static;
-                padding: 6px 12px;
-                gap: 20px;
+                padding: 10px 6px;
+                gap: 12px;
                 justify-content: flex-start;
                 overflow-x: auto;
                 -webkit-overflow-scrolling: touch;
-                border-radius: 10px;
-                height: 44px;
+                border-radius: 16px;
+                height: auto;
+                min-height: 82px;
+                scroll-snap-type: x mandatory;
             }
 
             .index-banner::-webkit-scrollbar {
@@ -3090,17 +3092,35 @@
 
             .idx-item {
                 flex-direction: column;
-                gap: 1px;
-                align-items: center;
+                gap: 4px;
+                align-items: flex-start;
                 flex-shrink: 0;
+                scroll-snap-align: start;
+                min-width: 156px;
+                padding: 14px 18px;
+                border-radius: 16px;
+                background: rgba(14, 22, 42, 0.75);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
             }
 
             .idx-name {
-                font-size: 8px;
+                font-size: 12px;
+                font-weight: 800;
+                color: #94a3b8;
+                letter-spacing: 0.8px;
             }
 
             .idx-price {
-                font-size: 11px;
+                font-size: 19px;
+                font-weight: 900;
+                font-family: 'JetBrains Mono', monospace;
+                color: #ffffff;
+                letter-spacing: -0.4px;
+            }
+
+            .idx-chg {
+                font-size: 13px;
                 font-weight: 700;
             }
 
