@@ -455,11 +455,100 @@
         }
     };
 
+    // ── Prevent Index Banner & Stat Cards Cutoff ─────────────────────────────
+    function fixIndexBannerLayout() {
+        const banners = document.querySelectorAll('.index-banner');
+        banners.forEach(b => {
+            b.style.setProperty('display', 'flex', 'important');
+            b.style.setProperty('flex-direction', 'row', 'important');
+            b.style.setProperty('height', 'auto', 'important');
+            b.style.setProperty('min-height', '84px', 'important');
+            b.style.setProperty('max-height', 'none', 'important');
+            b.style.setProperty('overflow-x', 'auto', 'important');
+            b.style.setProperty('overflow-y', 'hidden', 'important');
+            b.style.setProperty('padding', '6px 2px 8px 2px', 'important');
+            b.style.setProperty('margin-top', '4px', 'important');
+            b.style.setProperty('margin-bottom', '4px', 'important');
+            b.style.setProperty('scroll-snap-type', 'x mandatory', 'important');
+            b.style.setProperty('gap', '12px', 'important');
+
+            // Setup Carousel Dots if not already present
+            let dotsContainer = b.parentNode.querySelector('.index-carousel-dots');
+            if (!dotsContainer) {
+                dotsContainer = document.createElement('div');
+                dotsContainer.className = 'index-carousel-dots';
+                dotsContainer.innerHTML = `
+                    <span class="idx-dot active" data-page="0"></span>
+                    <span class="idx-dot" data-page="1"></span>
+                    <span class="idx-dot" data-page="2"></span>
+                `;
+                b.parentNode.insertBefore(dotsContainer, b.nextSibling);
+
+                dotsContainer.querySelectorAll('.idx-dot').forEach((dot, idx) => {
+                    dot.onclick = () => {
+                        haptic("light");
+                        const scrollDist = idx * (b.clientWidth + 12);
+                        b.scrollTo({ left: scrollDist, behavior: 'smooth' });
+                    };
+                });
+
+                b.addEventListener('scroll', () => {
+                    const scrollPos = b.scrollLeft;
+                    const page = Math.min(2, Math.round(scrollPos / (b.clientWidth * 0.95)));
+                    dotsContainer.querySelectorAll('.idx-dot').forEach((d, i) => {
+                        d.classList.toggle('active', i === page);
+                    });
+                }, { passive: true });
+            }
+        });
+
+        const items = document.querySelectorAll('.idx-item');
+        items.forEach(it => {
+            it.style.setProperty('flex', '0 0 calc(50% - 6px)', 'important');
+            it.style.setProperty('width', 'calc(50% - 6px)', 'important');
+            it.style.setProperty('min-width', 'calc(50% - 6px)', 'important');
+            it.style.setProperty('max-width', 'calc(50% - 6px)', 'important');
+            it.style.setProperty('scroll-snap-align', 'start', 'important');
+            it.style.setProperty('scroll-snap-stop', 'always', 'important');
+            it.style.setProperty('height', 'auto', 'important');
+            it.style.setProperty('min-height', '82px', 'important');
+            it.style.setProperty('overflow', 'hidden', 'important');
+            it.style.setProperty('box-sizing', 'border-box', 'important');
+            it.style.setProperty('display', 'flex', 'important');
+            it.style.setProperty('flex-direction', 'column', 'important');
+            it.style.setProperty('justify-content', 'space-between', 'important');
+        });
+
+        // Balance the 2x2 + 1 hero ribbon cards grid
+        const ribbon = document.querySelector('.ribbon');
+        if (ribbon) {
+            ribbon.style.setProperty('display', 'grid', 'important');
+            ribbon.style.setProperty('grid-template-columns', '1fr 1fr', 'important');
+            ribbon.style.setProperty('gap', '10px', 'important');
+            ribbon.style.setProperty('margin-bottom', '14px', 'important');
+            const cards = ribbon.querySelectorAll('.stat-card');
+            if (cards.length >= 5) {
+                cards[0].style.setProperty('order', '1', 'important'); // Daily P&L
+                cards[1].style.setProperty('order', '2', 'important'); // Trade Quota
+                cards[2].style.setProperty('order', '3', 'important'); // Account Balance
+                cards[4].style.setProperty('order', '4', 'important'); // Market Pulse
+                cards[3].style.setProperty('order', '5', 'important'); // Active Position
+                cards[3].style.setProperty('grid-column', '1 / -1', 'important');
+            }
+        }
+
+        const appPage = document.getElementById('app-page') || document.querySelector('.page');
+        if (appPage) {
+            appPage.style.setProperty('padding-bottom', 'calc(88px + var(--safe-bottom, 0px))', 'important');
+        }
+    }
+
     // ── Initialization Loop ───────────────────────────────────────────────────
     function init() {
         setupMobileHeader();
         setupHamburgerDrawer();
         setupMobileBottomNav();
+        fixIndexBannerLayout();
 
         // Safe area adjustments
         document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
@@ -472,6 +561,11 @@
     }
 
     // Secondary backup run after page resources stabilize
-    window.addEventListener("load", init);
+    window.addEventListener("load", () => {
+        init();
+        setTimeout(fixIndexBannerLayout, 300);
+        setTimeout(fixIndexBannerLayout, 1000);
+        setTimeout(fixIndexBannerLayout, 2500);
+    });
 
 })();
