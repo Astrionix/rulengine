@@ -18,9 +18,27 @@ def get_ist_date():
     return datetime.now(IST).date()
 
 def get_database_engine():
-    """Connects to MySQL if available, otherwise falls back gracefully to SQLite."""
+    """Connects to Supabase / PostgreSQL, MySQL, or falls back gracefully to SQLite."""
+    # 1. Supabase / PostgreSQL Cloud Database
+    supabase_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL") or getattr(Config, "SUPABASE_DB_URL", "")
+    if supabase_url:
+        try:
+            pg_url = supabase_url
+            if pg_url.startswith("postgres://"):
+                pg_url = pg_url.replace("postgres://", "postgresql+psycopg2://", 1)
+            elif pg_url.startswith("postgresql://") and not pg_url.startswith("postgresql+psycopg2://"):
+                pg_url = pg_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+            eng = create_engine(pg_url, echo=False, pool_recycle=1800, pool_pre_ping=True)
+            with eng.connect() as test_conn:
+                pass
+            print("SUCCESS: Connected to Supabase / PostgreSQL Cloud Database.")
+            return eng
+        except Exception as e:
+            print(f"WARNING: Supabase connection failed ({e}). Checking alternatives...")
+
+    # 2. MySQL fallback
     use_sqlite = getattr(Config, 'DB_DIALECT', 'auto') == 'sqlite'
-    if not use_sqlite:
+    if not use_sqlite and Config.DB_HOST:
         try:
             connection = pymysql.connect(
                 host=Config.DB_HOST,
@@ -36,7 +54,6 @@ def get_database_engine():
             connection.close()
             mysql_url = f"mysql+pymysql://{Config.DB_USER}:{Config.DB_PASSWORD}@{Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_NAME}"
             eng = create_engine(mysql_url, echo=False, pool_recycle=3600)
-            # Test connection
             with eng.connect() as test_conn:
                 pass
             print(f"SUCCESS: MySQL Database '{Config.DB_NAME}' connected.")
@@ -44,6 +61,7 @@ def get_database_engine():
         except Exception as e:
             print(f"INFO: MySQL not reachable ({e}). Falling back to SQLite local database.")
     
+    # 3. SQLite fallback
     sqlite_url = "sqlite:///trade_history.db"
     return create_engine(sqlite_url, echo=False, connect_args={"check_same_thread": False})
 

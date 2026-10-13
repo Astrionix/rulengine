@@ -33,7 +33,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "IntraBotPrefs";
     private static final String KEY_SERVER_URL = "server_url";
-    private static final String DEFAULT_SERVER_URL = "http://10.0.2.2:8000";
+    private static final String DEFAULT_SERVER_URL = "https://bot.deepcodev.site";
 
     private WebView webView;
     private SwipeRefreshLayout swipeRefresh;

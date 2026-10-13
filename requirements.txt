@@ -27,6 +27,7 @@ protobuf
 # Database & Cryptography
 sqlalchemy
 pymysql
+psycopg2-binary
 cryptography
 bcrypt
 python-dotenv
