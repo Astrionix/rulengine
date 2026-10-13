@@ -258,7 +258,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Presets helper text
         TextView presets = new TextView(this);
-        presets.setText("\nPresets:\n• Android Emulator: http://10.0.2.2:8000\n• Local Wi-Fi (replace IP): http://192.168.1.100:8000\n• Bundled Offline: file:///android_asset/www/index.html");
+        presets.setText("\nQuick Presets:\n• Cloud Live: https://bot.deepcodev.site\n• Android Emulator: http://10.0.2.2:8000\n• Local Wi-Fi: http://192.168.1.X:8000\n• Offline Assets: file:///android_asset/www/index.html");
         presets.setTextSize(12);
         presets.setTextColor(0xFF94A3B8);
         layout.addView(presets);
