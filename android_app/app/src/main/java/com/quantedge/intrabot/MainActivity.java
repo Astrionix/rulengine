@@ -29,6 +29,11 @@ import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
+import android.util.Base64;
+import android.util.Log;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "IntraBotPrefs";
@@ -121,13 +126,7 @@ public class MainActivity extends AppCompatActivity {
                 swipeRefresh.setRefreshing(false);
                 progressBar.setVisibility(View.GONE);
 
-                // Ensure Android APK identifies itself so bottom nav dock renders strictly in the APK
-                view.evaluateJavascript(
-                    "(function() {" +
-                    "  document.documentElement.classList.add('is-android-app');" +
-                    "  if (document.body) document.body.classList.add('is-android-app');" +
-                    "})()", null
-                );
+                injectMobileUiEnhancements(view);
             }
 
             @Override
@@ -217,6 +216,52 @@ public class MainActivity extends AppCompatActivity {
 
         currentServerUrlText.setText("Server: " + url);
         webView.loadUrl(url);
+    }
+
+    private void injectMobileUiEnhancements(WebView view) {
+        try {
+            // 1. Identify Android environment
+            view.evaluateJavascript(
+                "(function() {" +
+                "  document.documentElement.classList.add('is-android-app');" +
+                "  if (document.body) document.body.classList.add('is-android-app');" +
+                "})()", null
+            );
+
+            // 2. Read and inject mobile-glass.css
+            InputStream isCss = getAssets().open("www/mobile-glass.css");
+            byte[] bufCss = new byte[isCss.available()];
+            isCss.read(bufCss);
+            isCss.close();
+            String css = new String(bufCss, StandardCharsets.UTF_8);
+            String encodedCss = Base64.encodeToString(css.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+            String jsInjectCss = "(function() {" +
+                "  if (document.getElementById('injected-mobile-glass-css')) return;" +
+                "  var s = document.createElement('style');" +
+                "  s.id = 'injected-mobile-glass-css';" +
+                "  s.innerHTML = decodeURIComponent(escape(window.atob('" + encodedCss + "')));" +
+                "  document.head.appendChild(s);" +
+                "})()";
+            view.evaluateJavascript(jsInjectCss, null);
+
+            // 3. Read and inject android-adapter.js
+            InputStream isJs = getAssets().open("www/android-adapter.js");
+            byte[] bufJs = new byte[isJs.available()];
+            isJs.read(bufJs);
+            isJs.close();
+            String js = new String(bufJs, StandardCharsets.UTF_8);
+            String encodedJs = Base64.encodeToString(js.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+            String jsInjectScript = "(function() {" +
+                "  if (document.getElementById('injected-android-adapter-js')) return;" +
+                "  var sc = document.createElement('script');" +
+                "  sc.id = 'injected-android-adapter-js';" +
+                "  sc.innerHTML = decodeURIComponent(escape(window.atob('" + encodedJs + "')));" +
+                "  document.body.appendChild(sc);" +
+                "})()";
+            view.evaluateJavascript(jsInjectScript, null);
+        } catch (Exception e) {
+            Log.e("MainActivity", "Failed to inject mobile enhancements: " + e.getMessage());
+        }
     }
 
     private void showErrorView() {

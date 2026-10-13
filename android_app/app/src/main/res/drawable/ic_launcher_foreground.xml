@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer Circular Trading Border -->
+    <path
+        android:strokeColor="#FF6B00"
+        android:strokeWidth="2.5"
+        android:pathData="M54,18 A36,36 0 1,1 24,72" />
+
+    <!-- Bullish Candlestick 1 (Left, Cyan/Green) -->
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M37,48h7v24h-7z" />
+    <path
+        android:strokeColor="#00E676"
+        android:strokeWidth="1.8"
+        android:pathData="M40.5,42v36" />
+
+    <!-- Bullish Candlestick 2 (Center, High Breakout) -->
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M50,38h8v30h-8z" />
+    <path
+        android:strokeColor="#00E676"
+        android:strokeWidth="1.8"
+        android:pathData="M54,30v44" />
+
+    <!-- Candlestick 3 (Right, Orange Accent) -->
+    <path
+        android:fillColor="#FF6B00"
+        android:pathData="M64,32h7v28h-7z" />
+    <path
+        android:strokeColor="#FF6B00"
+        android:strokeWidth="1.8"
+        android:pathData="M67.5,24v42" />
+
+    <!-- Dynamic Breakout Trend Arrow -->
+    <path
+        android:strokeColor="#00E676"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M30,68 L48,52 L62,56 L78,32" />
+
+    <!-- Arrow Head -->
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M78,32 L68,34 L76,42 Z" />
+
+    <!-- Quantum Edge Pulse Dot -->
+    <path
+        android:fillColor="#FFAA00"
+        android:pathData="M78,32m-3,0a3,3 0,1,1 6,0a3,3 0,1,1 -6,0" />
+</vector>
